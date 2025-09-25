@@ -1,0 +1,15 @@
+embeddings:
+  model_id_or_path: "./models/sbert_large_nlu_ru"
+reranker:
+  enabled: true
+  model_path: "./models/reranker_ru"
+llm:
+  enabled: true
+  gguf_path: "./models/llm/phi-3-mini-4k-instruct-q4.gguf"
+storage:
+  mode: "file"
+  file_index_dir: "../01_prepare_doc/outputs"
+thresholds:
+  match_cosine_min: 0.2
+  coverage_min: 0.85
+  extra_max_share: 0.05
