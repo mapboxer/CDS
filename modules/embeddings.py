@@ -55,15 +55,6 @@ class EmbeddingBackend:
         if path:
             path_obj = Path(path)
             if not path_obj.exists():
-                logging.error(
-                    "Указанный путь к модели SBERT не существует: '%s'. "
-                    "Проверьте настройку local_sbert_path.",
-                    path,
-                )
-                self._init_tfidf_backend(
-                    "не найден путь к локальной модели SBERT"
-                )
-                return
 
             try:
                 model_kwargs = {"local_files_only": self.cfg.local_files_only}
@@ -75,38 +66,13 @@ class EmbeddingBackend:
                     tokenizer_kwargs=tokenizer_kwargs,
                 )
             except OSError as exc:
-                logging.error(
-                    "Не удалось загрузить модель SBERT из каталога '%s': %s",
-                    path,
-                    exc,
-                )
-                self._init_tfidf_backend(
-                    "ошибка чтения файлов модели SBERT"
-                )
-                return
+
 
             # infer dimension by encoding a dummy
             vec = self._model.encode(["test"])
             self._dim = int(vec.shape[1])
         else:
-            self._init_tfidf_backend(
-                "путь к локальной модели SBERT не указан"
-            )
-
-    def _init_tfidf_backend(self, reason: Optional[str] = None):
-        if reason:
-            logging.warning(
-                "Используется запасной вариант TF-IDF, потому что %s.",
-                reason,
-            )
-        else:
-            logging.warning(
-                "Используется запасной вариант TF-IDF в качестве резервного эмбеддинга."
-            )
-
-        self._model = None
-        self._tfidf = TfidfVectorizer(max_features=4096)
-        self._dim = 4096
+            pass
 
     def _resize_embeddings(self, embeddings: np.ndarray, target_dim: int) -> np.ndarray:
         """
