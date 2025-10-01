@@ -4,6 +4,7 @@ from typing import List, Optional, Dict, Any, Tuple
 import numpy as np
 from pathlib import Path
 import json
+import logging
 
 # heavy libs (already in requirements)
 from sentence_transformers import SentenceTransformer
@@ -51,13 +52,38 @@ class EmbeddingBackend:
 
     def _load_model(self):
         path = self.cfg.local_sbert_path
-        if path and Path(path).exists():
-            self._model = SentenceTransformer(path, device=self.cfg.device)
+        if path:
+            path_obj = Path(path)
+            if not path_obj.exists():
+                raise FileNotFoundError(
+                    f"Указанный путь к модели SBERT не существует: '{path}'. "
+                    "Проверьте настройку local_sbert_path."
+                )
+
+            try:
+                model_kwargs = {"local_files_only": self.cfg.local_files_only}
+                tokenizer_kwargs = {"local_files_only": self.cfg.local_files_only}
+                self._model = SentenceTransformer(
+                    str(path_obj),
+                    device=self.cfg.device,
+                    model_kwargs=model_kwargs,
+                    tokenizer_kwargs=tokenizer_kwargs,
+                )
+            except OSError as exc:
+                raise FileNotFoundError(
+                    "Не удалось загрузить модель SBERT из каталога "
+                    f"'{path}'. Убедитесь, что в директории присутствуют файлы "
+                    "pytorch_model.bin или model.safetensors, а также config.json."
+                ) from exc
+
             # infer dimension by encoding a dummy
             vec = self._model.encode(["test"])
             self._dim = int(vec.shape[1])
         else:
             # fallback: TF-IDF
+            logging.warning(
+                "Путь к локальной модели SBERT не указан. Используется запасной вариант TF-IDF."
+            )
             self._tfidf = TfidfVectorizer(max_features=4096)
             self._dim = 4096
 
