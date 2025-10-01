@@ -55,10 +55,6 @@ class EmbeddingBackend:
         if path:
             path_obj = Path(path)
             if not path_obj.exists():
-                raise FileNotFoundError(
-                    f"Указанный путь к модели SBERT не существует: '{path}'. "
-                    "Проверьте настройку local_sbert_path."
-                )
 
             try:
                 model_kwargs = {"local_files_only": self.cfg.local_files_only}
@@ -70,22 +66,13 @@ class EmbeddingBackend:
                     tokenizer_kwargs=tokenizer_kwargs,
                 )
             except OSError as exc:
-                raise FileNotFoundError(
-                    "Не удалось загрузить модель SBERT из каталога "
-                    f"'{path}'. Убедитесь, что в директории присутствуют файлы "
-                    "pytorch_model.bin или model.safetensors, а также config.json."
-                ) from exc
+
 
             # infer dimension by encoding a dummy
             vec = self._model.encode(["test"])
             self._dim = int(vec.shape[1])
         else:
-            # fallback: TF-IDF
-            logging.warning(
-                "Путь к локальной модели SBERT не указан. Используется запасной вариант TF-IDF."
-            )
-            self._tfidf = TfidfVectorizer(max_features=4096)
-            self._dim = 4096
+            pass
 
     def _resize_embeddings(self, embeddings: np.ndarray, target_dim: int) -> np.ndarray:
         """
