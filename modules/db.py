@@ -385,40 +385,50 @@ class DB:
                         ",".join(
                             [f"{float(x):.6f}" for x in title_embedding]) + "]"
 
+                    # Нормализация весов: если шаблон не содержит заголовка,
+                    # комбинированное сходство должно опираться только на текст документа.
+                    weight_sum = document_weight + title_weight
+                    if weight_sum <= 0:
+                        weight_sum = 1.0
+
                     cur.execute("""
-                        SELECT 
+                        SELECT
                             id,
                             name,
                             version,
                             created_at,
                             title,
                             (1 - (embedding <=> %s::vector)) as doc_similarity,
-                            CASE 
+                            CASE
                                 WHEN title_emb IS NOT NULL THEN (1 - (title_emb <=> %s::vector))
                                 ELSE 0
                             END as title_similarity,
-                            (
-                                %s * (1 - (embedding <=> %s::vector)) + 
-                                %s * CASE 
-                                    WHEN title_emb IS NOT NULL THEN (1 - (title_emb <=> %s::vector))
-                                    ELSE 0
-                                END
-                            ) as combined_similarity
-                        FROM templates 
-                        WHERE embedding IS NOT NULL 
+                            CASE
+                                WHEN title_emb IS NOT NULL THEN (
+                                    %s * (1 - (embedding <=> %s::vector)) +
+                                    %s * (1 - (title_emb <=> %s::vector))
+                                ) / %s
+                                ELSE (1 - (embedding <=> %s::vector))
+                            END as combined_similarity
+                        FROM templates
+                        WHERE embedding IS NOT NULL
                             AND (
-                                %s * (1 - (embedding <=> %s::vector)) + 
-                                %s * CASE 
-                                    WHEN title_emb IS NOT NULL THEN (1 - (title_emb <=> %s::vector))
-                                    ELSE 0
+                                CASE
+                                    WHEN title_emb IS NOT NULL THEN (
+                                        %s * (1 - (embedding <=> %s::vector)) +
+                                        %s * (1 - (title_emb <=> %s::vector))
+                                    ) / %s
+                                    ELSE (1 - (embedding <=> %s::vector))
                                 END
                             ) >= %s
                         ORDER BY combined_similarity DESC
                         LIMIT %s
                     """, (
-                        doc_vec_str, title_vec_str,  # для вычисления similarity
-                        document_weight, doc_vec_str, title_weight, title_vec_str,  # для combined_similarity
-                        document_weight, doc_vec_str, title_weight, title_vec_str,  # для HAVING
+                        doc_vec_str, title_vec_str,
+                        document_weight, doc_vec_str, title_weight, title_vec_str, weight_sum,
+                        doc_vec_str,
+                        document_weight, doc_vec_str, title_weight, title_vec_str, weight_sum,
+                        doc_vec_str,
                         threshold, limit
                     ))
                 else:
