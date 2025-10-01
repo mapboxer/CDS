@@ -4,6 +4,7 @@ from typing import List, Optional, Dict, Any, Tuple
 import numpy as np
 from pathlib import Path
 import json
+import logging
 
 # heavy libs (already in requirements)
 from sentence_transformers import SentenceTransformer
@@ -50,16 +51,73 @@ class EmbeddingBackend:
         return int(self._dim)
 
     def _load_model(self):
+        """Инициализация основного эмбеддинг-бэкенда.
+
+        Сначала пробуем загрузить локальную модель SBERT. Если путь не указан,
+        не существует или из него нельзя загрузить веса — переходим на
+        резервный TF-IDF векторизатор.
+        """
+
         path = self.cfg.local_sbert_path
-        if path and Path(path).exists():
-            self._model = SentenceTransformer(path, device=self.cfg.device)
-            # infer dimension by encoding a dummy
-            vec = self._model.encode(["test"])
-            self._dim = int(vec.shape[1])
+        if not path:
+            self._init_tfidf_backend(
+                "путь к локальной модели SBERT не указан"
+            )
+            return
+
+        path_obj = Path(path)
+        if not path_obj.exists():
+            logging.error(
+                "Указанный путь к модели SBERT не существует: '%s'. "
+                "Проверьте настройку local_sbert_path.",
+                path,
+            )
+            self._init_tfidf_backend(
+                "не найден путь к локальной модели SBERT"
+            )
+            return
+
+        try:
+            model_kwargs = {"local_files_only": self.cfg.local_files_only}
+            tokenizer_kwargs = {"local_files_only": self.cfg.local_files_only}
+            self._model = SentenceTransformer(
+                str(path_obj),
+                device=self.cfg.device,
+                model_kwargs=model_kwargs,
+                tokenizer_kwargs=tokenizer_kwargs,
+            )
+        except OSError as exc:
+            logging.error(
+                "Не удалось загрузить модель SBERT из каталога '%s': %s",
+                path,
+                exc,
+            )
+            self._init_tfidf_backend(
+                "ошибка чтения файлов модели SBERT"
+            )
+            return
+
+        # Успешно загрузили SBERT — определяем размерность модели
+        vec = self._model.encode(["__probe__"], convert_to_numpy=True)
+        if len(vec.shape) == 1:
+            self._dim = int(vec.shape[0])
         else:
-            # fallback: TF-IDF
-            self._tfidf = TfidfVectorizer(max_features=4096)
-            self._dim = 4096
+            self._dim = int(vec.shape[1])
+
+    def _init_tfidf_backend(self, reason: Optional[str] = None):
+        if reason:
+            logging.warning(
+                "Используется запасной вариант TF-IDF, потому что %s.",
+                reason,
+            )
+        else:
+            logging.warning(
+                "Используется запасной вариант TF-IDF в качестве резервного эмбеддинга."
+            )
+
+        self._model = None
+        self._tfidf = TfidfVectorizer(max_features=4096)
+        self._dim = 4096
 
     def _resize_embeddings(self, embeddings: np.ndarray, target_dim: int) -> np.ndarray:
         """
