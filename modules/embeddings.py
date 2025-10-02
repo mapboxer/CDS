@@ -4,7 +4,6 @@ from typing import List, Optional, Dict, Any, Tuple
 import numpy as np
 from pathlib import Path
 import json
-import logging
 
 # heavy libs (already in requirements)
 from sentence_transformers import SentenceTransformer
@@ -52,27 +51,15 @@ class EmbeddingBackend:
 
     def _load_model(self):
         path = self.cfg.local_sbert_path
-        if path:
-            path_obj = Path(path)
-            if not path_obj.exists():
-
-            try:
-                model_kwargs = {"local_files_only": self.cfg.local_files_only}
-                tokenizer_kwargs = {"local_files_only": self.cfg.local_files_only}
-                self._model = SentenceTransformer(
-                    str(path_obj),
-                    device=self.cfg.device,
-                    model_kwargs=model_kwargs,
-                    tokenizer_kwargs=tokenizer_kwargs,
-                )
-            except OSError as exc:
-
-
+        if path and Path(path).exists():
+            self._model = SentenceTransformer(path, device=self.cfg.device)
             # infer dimension by encoding a dummy
             vec = self._model.encode(["test"])
             self._dim = int(vec.shape[1])
         else:
-            pass
+            # fallback: TF-IDF
+            self._tfidf = TfidfVectorizer(max_features=4096)
+            self._dim = 4096
 
     def _resize_embeddings(self, embeddings: np.ndarray, target_dim: int) -> np.ndarray:
         """

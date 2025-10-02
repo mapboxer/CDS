@@ -35,19 +35,18 @@ def classify_document(
     db: DB,
     document_text: str,
     title_text: str = None,
-    similarity_threshold: float = 0.84,
-    document_weight: float = 0.7,
-    title_weight: float = 0.3
+    document_weight: float = 0.9,
+    title_weight: float = 0.1
 ) -> Tuple[Optional[str], Optional[float], Optional[Dict[str, float]]]:
     """
     Улучшенная классификация документа по эмбеддингу документа и названия.
+    Всегда возвращает наиболее похожий шаблон с реальным процентом схожести.
 
     Args:
         emb_backend: бэкенд для создания эмбеддингов
         db: подключение к базе данных
         document_text: полный текст документа
         title_text: название документа (опционально)
-        similarity_threshold: минимальный порог комбинированного сходства
         document_weight: вес эмбеддинга документа (по умолчанию 0.7)
         title_weight: вес эмбеддинга названия (по умолчанию 0.3)
 
@@ -62,12 +61,12 @@ def classify_document(
     if title_text and title_text.strip():
         title_embedding = emb_backend.encode([title_text])[0]
 
-    # Ищем похожие шаблоны с улучшенным методом
+    # Ищем наиболее похожий шаблон без порога отсечения
     similar_docs = db.find_similar_documents_enhanced(
         document_embedding,
         title_embedding=title_embedding,
         limit=1,
-        threshold=similarity_threshold,
+        threshold=0.0,  # Убираем порог отсечения
         document_weight=document_weight,
         title_weight=title_weight
     )
@@ -166,7 +165,7 @@ def main():
     logger.info("=" * 60)
     logger.info(f"Директория входящих документов: {args.input_dir}")
     logger.info(f"Модель SBERT: {args.sbert_path}")
-    logger.info(f"Порог схожести: {args.similar_id*100:.1f}%")
+    logger.info(f"Режим: поиск наиболее похожего шаблона (без порога отсечения)")
     logger.info(f"Размерность эмбеддингов: {args.embedding_dim}")
     logger.info(f"Использование БД: {args.use_db}")
     logger.info(f"ID сессии: {args.session_id}")
@@ -310,23 +309,27 @@ def main():
             similar_template_id, similarity_score, detailed_scores = classify_document(
                 emb, db, full_document_text,
                 title_text=extracted_title,
-                similarity_threshold=args.similar_id,
                 document_weight=args.document_weight,
                 title_weight=args.title_weight
             )
 
             if similar_template_id:
                 logger.info(
-                    f"  ✅ КЛАССИФИЦИРОВАН: комбинированная похожесть {similarity_score*100:.1f}% с шаблоном {similar_template_id}")
+                    f"  🟢 НАЙДЕН НАИБОЛЕЕ ПОХОЖИЙ ШАБЛОН: комбинированная похожесть {similarity_score*100:.1f}% с шаблоном {similar_template_id}")
                 if detailed_scores:
                     logger.info(
                         f"     - Похожесть по документу: {detailed_scores['doc_similarity']*100:.1f}%")
                     logger.info(
                         f"     - Похожесть по названию: {detailed_scores['title_similarity']*100:.1f}%")
-                total_classified += 1
+
+                # Считаем как классифицированный, если похожесть >= 50%
+                if similarity_score >= 0.5:
+                    total_classified += 1
+                else:
+                    total_unclassified += 1
             else:
                 logger.info(
-                    f"  ❌ НЕ КЛАССИФИЦИРОВАН: не найден шаблон с похожестью >= {args.similar_id*100:.1f}%")
+                    f"  🔴 НЕ НАЙДЕН ПОДХОДЯЩИЙ ШАБЛОН")
                 total_unclassified += 1
 
             # 4. Продвинутый чанкинг (как в index_templates.py)
@@ -411,12 +414,13 @@ def main():
     logger.info("КЛАССИФИКАЦИЯ ЗАВЕРШЕНА")
     logger.info("=" * 60)
     logger.info(f"Обработано документов: {total_processed}")
-    logger.info(f"Классифицировано успешно: {total_classified}")
-    logger.info(f"Не классифицировано: {total_unclassified}")
+    logger.info(f"Найдено похожих шаблонов (>=50%): {total_classified}")
+    logger.info(f"Низкая похожесть (<50%): {total_unclassified}")
 
     if total_processed > 0:
         success_rate = (total_classified / total_processed) * 100
-        logger.info(f"Процент успешной классификации: {success_rate:.1f}%")
+        logger.info(
+            f"Процент документов с высокой похожестью (>=50%): {success_rate:.1f}%")
 
     # Подробный отчет по классифицированным документам
     if classification_results:
@@ -439,7 +443,7 @@ def main():
                 logger.info(f"   Шаблон: {result['similar_template_id']}")
                 logger.info(f"   Чанков: {result['chunks_count']}")
             else:
-                logger.info(f"📄 {result['file_name']} - НЕ КЛАССИФИЦИРОВАН")
+                logger.info(f"📄 {result['file_name']} - ШАБЛОН НЕ НАЙДЕН")
                 if result.get("extracted_title"):
                     logger.info(f"   Название: '{result['extracted_title']}'")
                     logger.info(f"   Чанков: {result['chunks_count']}")

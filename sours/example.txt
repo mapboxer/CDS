@@ -1,0 +1,220 @@
+-- Create DB
+-- Ошибка LC_COLLATE
+-- Посмотреть доступные локали:
+SELECT collname, locale, provider
+FROM pg_collation
+ORDER BY collname
+LIMIT 50;
+
+-- Пересоздать БД
+DROP DATABASE documents_cem;
+
+-- Linux/macOS: пример с UTF-8 русской локалью
+CREATE DATABASE documents_cem
+  TEMPLATE template0
+  ENCODING 'UTF8'
+  LC_COLLATE 'ru_RU.utf8'
+  LC_CTYPE   'ru_RU.utf8';
+
+-- Windows: используйте точные имена из pg_collation (пример!)
+-- CREATE DATABASE documents_cem TEMPLATE template0 ENCODING 'UTF8'
+--   LC_COLLATE 'Russian_Russia.utf8' LC_CTYPE 'Russian_Russia.utf8';
+
+
+-- Create tables
+
+"""
+CREATE EXTENSION IF NOT EXISTS vector;
+
+CREATE TABLE IF NOT EXISTS templates (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    version TEXT,
+    created_at TIMESTAMP DEFAULT now(),
+    is_active BOOLEAN DEFAULT TRUE,
+    embedding vector(1024)
+);
+
+CREATE TABLE IF NOT EXISTS template_chunks (
+    chunk_id TEXT PRIMARY KEY,
+    template_id TEXT NOT NULL REFERENCES templates(id) ON DELETE CASCADE,
+    ord INTEGER NOT NULL,
+    heading TEXT,
+    text TEXT NOT NULL,
+    embedding vector(1024)
+);
+
+-- Таблицы для входящих документов (аналогичные templates и template_chunks)
+CREATE TABLE IF NOT EXISTS docs_inserted (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    version TEXT,
+    created_at TIMESTAMP DEFAULT now(),
+    is_active BOOLEAN DEFAULT TRUE,
+    embedding vector(1024),
+    similar_id TEXT REFERENCES templates(id),
+    similarity_score FLOAT
+);
+
+CREATE TABLE IF NOT EXISTS docs_inserted_chunks (
+    chunk_id TEXT PRIMARY KEY,
+    doc_id TEXT NOT NULL REFERENCES docs_inserted(id) ON DELETE CASCADE,
+    ord INTEGER NOT NULL,
+    heading TEXT,
+    text TEXT NOT NULL,
+    embedding vector(1024)
+);
+
+-- Индексы для быстрого поиска
+CREATE INDEX IF NOT EXISTS idx_chunks_ivfflat ON template_chunks USING ivfflat (embedding vector_cosine_ops) WITH (lists=100);
+CREATE INDEX IF NOT EXISTS idx_templates_ivfflat ON templates USING ivfflat (embedding vector_cosine_ops) WITH (lists=100);
+CREATE INDEX IF NOT EXISTS idx_docs_inserted_ivfflat ON docs_inserted USING ivfflat (embedding vector_cosine_ops) WITH (lists=100);
+CREATE INDEX IF NOT EXISTS idx_docs_inserted_chunks_ivfflat ON docs_inserted_chunks USING ivfflat (embedding vector_cosine_ops) WITH (lists=100);
+"""
+
+-- SETTINGS  app_config.yaml
+embeddings:
+  model_id_or_path: "./models/sbert_large_nlu_ru"
+reranker:
+  enabled: true
+  model_path: "./models/reranker_ru"
+llm:
+  enabled: true
+  gguf_path: "./models/llm/phi-3-mini-4k-instruct-q4.gguf"
+storage:
+  mode: "file"
+  file_index_dir: "../01_Подготовительный_этап/outputs"
+thresholds:
+  match_cosine_min: 0.2
+  coverage_min: 0.85
+  extra_max_share: 0.05
+
+-- ADD DB in db.py
+
+def _pg_conn_from_env():
+    import psycopg2/Users/denis.murataev/Documents/Jyputer_notebooks/Cementum/PP_URIST/CAS_1path/outputs
+    host = os.getenv("PGHOST","localhost")
+    port = int(os.getenv("PGPORT","5432"))
+    db = os.getenv("PGDATABASE","documents_cem")
+    user = os.getenv("PGUSER","denis.murataev")
+    pwd = os.getenv("PGPASSWORD","123")
+    conn = psycopg2.connect(host=host, port=port, dbname=db, user=user, password=pwd)
+    conn.autocommit = True
+    return conn
+
+-- RUN
+python index_templates.py \
+    --templates-dir "./data/templates" \
+    --outputs-dir "./outputs" \
+    --sbert-path "./models/sbert_large_nlu_ru" \
+    --embedding-dim 1024 \
+    --chunk-size 350 \
+    --batch-size 32 \
+    --device cpu \
+    --use-db
+
+python index_templates.py \
+    --templates-dir "./data/templates_2" \
+    --outputs-dir "./outputs" \
+    --sbert-path "./models/sbert_large_nlu_ru" \
+    --embedding-dim 1024 \
+    --chunk-size 350 \
+    --batch-size 32 \
+    --device cpu \
+    --use-db
+
+--no outputs
+
+python index_templates.py \
+    --templates-dir "./data/templates" \
+    --sbert-path "./models/sbert_large_nlu_ru" \
+    --embedding-dim 1024 \
+    --chunk-size 350 \
+    --batch-size 32 \
+    --device cpu \
+    --use-db
+
+
+
+
+-- ИНСЕРТ
+./input/isert1
+
+
+python classification.py \
+    --input-dir "./input/isert1" \
+    --sbert-path "./models/sbert_large_nlu_ru" \
+    --similar_id 0.85 \
+    --embedding-dim 1024 \
+    --chunk-size 350 \
+    --batch-size 32 \
+    --device cpu \
+    --use-db
+
+-- TESTS
+
+
+DROP TABLE IF EXISTS docs_inserted_chunks CASCADE;
+DROP TABLE IF EXISTS docs_inserted CASCADE;
+
+
+
+
+SELECT * FROM public.docs_inserted
+ORDER BY id ASC LIMIT 100
+
+SELECT * FROM public.docs_inserted_chunks
+ORDER BY id ASC LIMIT 100
+
+SELECT * FROM public.templates
+ORDER BY id ASC LIMIT 100
+
+SELECT * FROM public.template_chunks
+ORDER BY id ASC LIMIT 100
+
+
+
+select * from public.templates where id = '59a0fe78-8fc6-47a0-8ed8-d4ae470fe970'
+
+
+Узнайте IP адрес вашего Mac
+
+$ ifconfig | grep "inet " | grep -v 127.0.0.1
+
+Запустить апп
+
+streamlit run app_nw.py --server.address 0.0.0.0 --server.port 8501
+
+Доступ в сети
+http://10.0.1.4:8501
+
+
+
+Удаление шаблонов из БД
+select * from public.templates
+
+
+
+SELECT
+    tc.constraint_name,
+    tc.table_name,
+    kcu.column_name,
+    ccu.table_name AS foreign_table_name,
+    ccu.column_name AS foreign_column_name
+FROM
+    information_schema.table_constraints AS tc
+    JOIN information_schema.key_column_usage AS kcu
+      ON tc.constraint_name = kcu.constraint_name
+    JOIN information_schema.constraint_column_usage AS ccu
+      ON ccu.constraint_name = tc.constraint_name
+WHERE
+    constraint_type = 'FOREIGN KEY'
+    AND ccu.table_name = 'templates';
+
+-- поочередно
+DELETE FROM public.docs_inserted WHERE similar_id = '30958f22-3aea-4075-a509-9503c5dd27f9';
+DELETE FROM public.docs_inserted WHERE user_choice_doc_id = '30958f22-3aea-4075-a509-9503c5dd27f9';
+DELETE FROM public.templates WHERE id = '30958f22-3aea-4075-a509-9503c5dd27f9';
+
+
+

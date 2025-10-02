@@ -380,44 +380,51 @@ class DB:
         with self._conn() as conn:
             with conn.cursor() as cur:
                 if title_embedding is not None:
-                    # Поиск с учетом обоих эмбеддингов. Комбинированный скор
-                    # пересчитывается на стороне Python, чтобы не занижать его
-                    # при отсутствии title_emb у шаблона.
+                    # Поиск с учетом обоих эмбеддингов
                     title_vec_str = "[" + \
                         ",".join(
                             [f"{float(x):.6f}" for x in title_embedding]) + "]"
 
-                    fetch_limit = max(limit * 5, 50)
-
                     cur.execute("""
-                        SELECT
+                        SELECT 
                             id,
                             name,
                             version,
                             created_at,
                             title,
                             (1 - (embedding <=> %s::vector)) as doc_similarity,
-                            CASE
+                            CASE 
                                 WHEN title_emb IS NOT NULL THEN (1 - (title_emb <=> %s::vector))
-                                ELSE NULL
-                            END as title_similarity,
-                            CASE
-                                WHEN title_emb IS NOT NULL THEN 1
                                 ELSE 0
-                            END as has_title_emb
-                        FROM templates
-                        WHERE embedding IS NOT NULL
-                        ORDER BY doc_similarity DESC
+                            END as title_similarity,
+                            (
+                                %s * (1 - (embedding <=> %s::vector)) + 
+                                %s * CASE 
+                                    WHEN title_emb IS NOT NULL THEN (1 - (title_emb <=> %s::vector))
+                                    ELSE 0
+                                END
+                            ) as combined_similarity
+                        FROM templates 
+                        WHERE embedding IS NOT NULL 
+                            AND (
+                                %s * (1 - (embedding <=> %s::vector)) + 
+                                %s * CASE 
+                                    WHEN title_emb IS NOT NULL THEN (1 - (title_emb <=> %s::vector))
+                                    ELSE 0
+                                END
+                            ) >= %s
+                        ORDER BY combined_similarity DESC
                         LIMIT %s
                     """, (
-                        doc_vec_str,
-                        title_vec_str,
-                        fetch_limit
+                        doc_vec_str, title_vec_str,  # для вычисления similarity
+                        document_weight, doc_vec_str, title_weight, title_vec_str,  # для combined_similarity
+                        document_weight, doc_vec_str, title_weight, title_vec_str,  # для HAVING
+                        threshold, limit
                     ))
                 else:
                     # Поиск только по эмбеддингу документа (как раньше)
                     cur.execute("""
-                        SELECT
+                        SELECT 
                             id,
                             name,
                             version,
@@ -434,61 +441,19 @@ class DB:
                     """, (doc_vec_str, doc_vec_str, doc_vec_str, threshold, limit))
 
                 results = []
-                rows = cur.fetchall()
-
-                for row in rows:
-                    doc_similarity = float(row[5]) if row[5] is not None else 0.0
-
-                    if title_embedding is not None:
-                        has_title_emb = bool(row[7])
-                        raw_title_similarity = row[6]
-                        title_similarity = (
-                            float(raw_title_similarity)
-                            if raw_title_similarity is not None
-                            else 0.0
-                        )
-
-                        if has_title_emb and (document_weight + title_weight) > 0:
-                            combined_similarity = (
-                                document_weight * doc_similarity +
-                                title_weight * title_similarity
-                            ) / (document_weight + title_weight)
-                        else:
-                            combined_similarity = doc_similarity
-                    else:
-                        title_similarity = 0.0
-                        combined_similarity = doc_similarity
-
+                for row in cur.fetchall():
                     results.append({
                         "template_id": row[0],
                         "name": row[1],
                         "version": row[2],
                         "created_at": row[3],
                         "title": row[4],
-                        "doc_similarity": doc_similarity,
-                        "title_similarity": title_similarity,
-                        "combined_similarity": combined_similarity,
+                        "doc_similarity": float(row[5]),
+                        "title_similarity": float(row[6]),
+                        "combined_similarity": float(row[7]),
                         # для обратной совместимости
-                        "similarity": combined_similarity
+                        "similarity": float(row[7])
                     })
-
-                if title_embedding is not None:
-                    # Фильтруем и сортируем результаты по комбинированному скору
-                    results = [
-                        r for r in results
-                        if r["combined_similarity"] >= threshold
-                    ]
-                    results.sort(
-                        key=lambda r: r["combined_similarity"],
-                        reverse=True
-                    )
-                    results = results[:limit]
-                else:
-                    # Для поиска только по документу фильтруем по doc_similarity
-                    results = [
-                        r for r in results
-                        if r["combined_similarity"] >= threshold
-                    ][:limit]
 
                 return results
 

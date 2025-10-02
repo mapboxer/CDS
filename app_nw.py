@@ -207,13 +207,15 @@ def run_classification(uploaded_files: List, temp_dir: str, session_id: str) -> 
             "python", "classification.py",
             "--input-dir", temp_dir,
             "--sbert-path", "./models/sbert_large_nlu_ru",
-            "--similar_id", "0.84",
+            "--similar_id", "0.80",  # Обновленный порог по умолчанию
             "--embedding-dim", "1024",
             "--chunk-size", "350",
-            "--batch-size", "32",
+            "--batch-size", "16",  # Обновленный размер батча
             "--device", "cpu",
             "--use-db",
-            "--session-id", session_id  # Передаем session_id в скрипт
+            "--session-id", session_id,  # Передаем session_id в скрипт
+            "--document-weight", "0.70",
+            "--title-weight", "0.30"
         ]
 
         # Запуск в conda окружении
@@ -982,6 +984,9 @@ def main():
         • **80-90%** - Документ скорее всего соответствует предложенным шаблонам\n  
         • **0-80%** - Документ скорее всего не соответствует ни одному шаблону (нестандартный)\n
         • **0% (null)** - Затрудняюсь ответить\n
+        
+        **Особенности:** Система всегда находит наиболее похожий шаблон с реальным процентом схожести.\n
+        Порог классификации: 80% (документы с меньшей схожестью считаются неклассифицированными).
         """)
 
         # st.info("Настройки")
