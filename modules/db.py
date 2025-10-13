@@ -54,11 +54,27 @@ CREATE TABLE IF NOT EXISTS docs_inserted_chunks (
     embedding vector(1024)
 );
 
+-- Таблица для хранения отредактированных чанков документа
+CREATE TABLE IF NOT EXISTS docs_inserted_chunks_edit (
+    id SERIAL PRIMARY KEY,
+    doc_id TEXT NOT NULL REFERENCES docs_inserted(id) ON DELETE CASCADE,
+    chunk_id TEXT NOT NULL,
+    ord INTEGER NOT NULL,
+    heading TEXT,
+    original_text TEXT NOT NULL,
+    edited_text TEXT NOT NULL,
+    is_modified BOOLEAN DEFAULT FALSE,
+    modified_at TIMESTAMP DEFAULT now(),
+    UNIQUE(doc_id, chunk_id)
+);
+
 -- Индексы для быстрого поиска
 CREATE INDEX IF NOT EXISTS idx_chunks_ivfflat ON template_chunks USING ivfflat (embedding vector_cosine_ops) WITH (lists=100);
 CREATE INDEX IF NOT EXISTS idx_templates_ivfflat ON templates USING ivfflat (embedding vector_cosine_ops) WITH (lists=100);
 CREATE INDEX IF NOT EXISTS idx_docs_inserted_ivfflat ON docs_inserted USING ivfflat (embedding vector_cosine_ops) WITH (lists=100);
 CREATE INDEX IF NOT EXISTS idx_docs_inserted_chunks_ivfflat ON docs_inserted_chunks USING ivfflat (embedding vector_cosine_ops) WITH (lists=100);
+CREATE INDEX IF NOT EXISTS idx_docs_inserted_chunks_edit_doc ON docs_inserted_chunks_edit (doc_id);
+CREATE INDEX IF NOT EXISTS idx_docs_inserted_chunks_edit_chunk ON docs_inserted_chunks_edit (chunk_id);
 CREATE INDEX IF NOT EXISTS idx_docs_inserted_session ON docs_inserted (session_id);
 """
 
@@ -92,9 +108,17 @@ class DB:
                     """)
                     chunks_table_exists = cur.fetchone()[0]
 
+                    cur.execute("""
+                        SELECT EXISTS (
+                            SELECT FROM information_schema.tables 
+                            WHERE table_name = 'docs_inserted_chunks_edit'
+                        );
+                    """)
+                    chunks_edit_table_exists = cur.fetchone()[0]
+
                     # Создаем таблицы только если они не существуют
-                    if not docs_table_exists or not chunks_table_exists:
-                        print("Создание таблиц для входящих документов...")
+                    if not docs_table_exists or not chunks_table_exists or not chunks_edit_table_exists:
+                        print("Создание недостающих таблиц...")
                         cur.execute(SCHEMA_SQL)
                     else:
                         print("Таблицы уже существуют, проверяем структуру...")
@@ -565,7 +589,8 @@ class DB:
                 return results
 
     def get_classification_results_by_session(self, session_id: str, limit: int = 100) -> List[Dict[str, Any]]:
-        """Получение результатов классификации входящих документов для конкретной сессии."""
+        """Получение результатов классификации входящих документов для конкретной сессии.
+        Если пользователь выбрал шаблон вручную (user_choice_doc_id), используются данные выбранного шаблона."""
         try:
             with self._conn() as conn:
                 with conn.cursor() as cur:
@@ -583,19 +608,21 @@ class DB:
                             "Таблица docs_inserted не существует, возвращаем пустой список")
                         return []
 
+                    # Обновленный запрос с учетом user_choice_doc_id
                     cur.execute("""
                         SELECT 
                             di.id,
                             di.name as doc_name,
                             di.created_at,
                             di.similarity_score,
-                            t.id as template_id,
-                            t.name as template_name,
-                            t.version as template_version,
+                            COALESCE(t_user.id, t_similar.id) as template_id,
+                            COALESCE(t_user.name, t_similar.name) as template_name,
+                            COALESCE(t_user.version, t_similar.version) as template_version,
                             di.session_id,
                             di.user_choice_doc_id
                         FROM docs_inserted di
-                        LEFT JOIN templates t ON di.similar_id = t.id
+                        LEFT JOIN templates t_similar ON di.similar_id = t_similar.id
+                        LEFT JOIN templates t_user ON di.user_choice_doc_id = t_user.id
                         WHERE di.session_id = %s
                         ORDER BY di.created_at DESC, di.similarity_score DESC
                         LIMIT %s
@@ -690,19 +717,181 @@ class DB:
             print(f"Ошибка при получении шаблонов: {e}")
             return []
 
-    def update_user_choice(self, doc_id: str, template_id: str) -> bool:
-        """Обновление выбора пользователя для документа."""
+    def update_user_choice(self, doc_id: str, template_id: str, new_similarity_score: float = None) -> bool:
+        """Обновление выбора пользователя для документа с обновлением similarity_score."""
         try:
             with self._conn() as conn:
                 with conn.cursor() as cur:
-                    cur.execute("""
-                        UPDATE docs_inserted 
-                        SET user_choice_doc_id = %s
-                        WHERE id = %s
-                    """, (template_id, doc_id))
+                    if new_similarity_score is not None:
+                        cur.execute("""
+                            UPDATE docs_inserted 
+                            SET user_choice_doc_id = %s,
+                                similar_id = %s,
+                                similarity_score = %s
+                            WHERE id = %s
+                        """, (template_id, template_id, new_similarity_score, doc_id))
+                    else:
+                        cur.execute("""
+                            UPDATE docs_inserted 
+                            SET user_choice_doc_id = %s
+                            WHERE id = %s
+                        """, (template_id, doc_id))
 
                 conn.commit()
                 return True
         except Exception as e:
             print(f"Ошибка при обновлении выбора пользователя: {e}")
             return False
+
+    def get_document_embeddings(self, doc_id: str) -> Optional[Tuple]:
+        """Получение эмбеддингов документа (document_embedding, title_embedding)."""
+        try:
+            with self._conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        SELECT embedding, title_emb
+                        FROM docs_inserted
+                        WHERE id = %s
+                    """, (doc_id,))
+
+                    row = cur.fetchone()
+                    if row:
+                        import numpy as np
+                        # Преобразуем pgvector обратно в numpy array
+                        # pgvector возвращает строку в формате "[x,y,z,...]"
+                        doc_emb = None
+                        if row[0] is not None:
+                            if isinstance(row[0], str):
+                                # Парсим строку формата "[x,y,z,...]"
+                                doc_emb = np.array(
+                                    [float(x) for x in row[0].strip('[]').split(',')])
+                            else:
+                                # Если уже список/массив
+                                doc_emb = np.array(row[0], dtype=np.float32)
+
+                        title_emb = None
+                        if row[1] is not None:
+                            if isinstance(row[1], str):
+                                title_emb = np.array(
+                                    [float(x) for x in row[1].strip('[]').split(',')])
+                            else:
+                                title_emb = np.array(row[1], dtype=np.float32)
+
+                        return (doc_emb, title_emb)
+                    return None
+        except Exception as e:
+            print(f"Ошибка при получении эмбеддингов документа: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+
+    def get_template_embeddings(self, template_id: str) -> Optional[Tuple]:
+        """Получение эмбеддингов шаблона (document_embedding, title_embedding)."""
+        try:
+            with self._conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        SELECT embedding, title_emb
+                        FROM templates
+                        WHERE id = %s
+                    """, (template_id,))
+
+                    row = cur.fetchone()
+                    if row:
+                        import numpy as np
+                        # Преобразуем pgvector обратно в numpy array
+                        # pgvector возвращает строку в формате "[x,y,z,...]"
+                        doc_emb = None
+                        if row[0] is not None:
+                            if isinstance(row[0], str):
+                                # Парсим строку формата "[x,y,z,...]"
+                                doc_emb = np.array(
+                                    [float(x) for x in row[0].strip('[]').split(',')])
+                            else:
+                                # Если уже список/массив
+                                doc_emb = np.array(row[0], dtype=np.float32)
+
+                        title_emb = None
+                        if row[1] is not None:
+                            if isinstance(row[1], str):
+                                title_emb = np.array(
+                                    [float(x) for x in row[1].strip('[]').split(',')])
+                            else:
+                                title_emb = np.array(row[1], dtype=np.float32)
+
+                        return (doc_emb, title_emb)
+                    return None
+        except Exception as e:
+            print(f"Ошибка при получении эмбеддингов шаблона: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+
+    def save_edited_chunks(self, doc_id: str, chunks_data: List[Dict[str, Any]]) -> bool:
+        """
+        Сохранение отредактированных чанков документа.
+
+        Args:
+            doc_id: ID документа
+            chunks_data: список словарей с данными чанков
+
+        Returns:
+            bool: True если успешно
+        """
+        try:
+            with self._conn() as conn:
+                with conn.cursor() as cur:
+                    for chunk in chunks_data:
+                        cur.execute("""
+                            INSERT INTO docs_inserted_chunks_edit 
+                                (doc_id, chunk_id, ord, heading, original_text, edited_text, is_modified)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s)
+                            ON CONFLICT (doc_id, chunk_id) 
+                            DO UPDATE SET 
+                                edited_text = EXCLUDED.edited_text,
+                                is_modified = EXCLUDED.is_modified,
+                                modified_at = now()
+                        """, (
+                            doc_id,
+                            chunk["chunk_id"],
+                            chunk["ord"],
+                            chunk.get("heading", ""),
+                            chunk["original_text"],
+                            chunk["edited_text"],
+                            chunk["is_modified"]
+                        ))
+                conn.commit()
+            return True
+        except Exception as e:
+            print(f"Ошибка сохранения отредактированных чанков: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+
+    def get_edited_chunks(self, doc_id: str) -> List[Dict[str, Any]]:
+        """Получение отредактированных чанков документа."""
+        try:
+            with self._conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        SELECT chunk_id, ord, heading, original_text, edited_text, is_modified, modified_at
+                        FROM docs_inserted_chunks_edit
+                        WHERE doc_id = %s
+                        ORDER BY ord
+                    """, (doc_id,))
+
+                    chunks = []
+                    for row in cur.fetchall():
+                        chunks.append({
+                            "chunk_id": row[0],
+                            "ord": row[1],
+                            "heading": row[2] or "",
+                            "original_text": row[3],
+                            "edited_text": row[4],
+                            "is_modified": row[5],
+                            "modified_at": row[6]
+                        })
+                    return chunks
+        except Exception as e:
+            print(f"Ошибка получения отредактированных чанков: {e}")
+            return []

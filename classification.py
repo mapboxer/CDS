@@ -35,8 +35,8 @@ def classify_document(
     db: DB,
     document_text: str,
     title_text: str = None,
-    document_weight: float = 0.9,
-    title_weight: float = 0.1
+    document_weight: float = 0.70,
+    title_weight: float = 0.30
 ) -> Tuple[Optional[str], Optional[float], Optional[Dict[str, float]]]:
     """
     Улучшенная классификация документа по эмбеддингу документа и названия.
@@ -47,8 +47,8 @@ def classify_document(
         db: подключение к базе данных
         document_text: полный текст документа
         title_text: название документа (опционально)
-        document_weight: вес эмбеддинга документа (по умолчанию 0.7)
-        title_weight: вес эмбеддинга названия (по умолчанию 0.3)
+        document_weight: вес эмбеддинга документа (по умолчанию 0.70)
+        title_weight: вес эмбеддинга названия (по умолчанию 0.30)
 
     Returns:
         Tuple[template_id, similarity_score, detailed_scores]: ID наиболее похожего шаблона, комбинированный скор и детальные скоры
@@ -149,14 +149,14 @@ def main():
     parser.add_argument(
         "--document-weight",
         type=float,
-        default=0.7,
-        help="Вес эмбеддинга документа при комбинированной классификации (по умолчанию 0.7)"
+        default=0.70,
+        help="Вес эмбеддинга документа при комбинированной классификации (по умолчанию 0.70)"
     )
     parser.add_argument(
         "--title-weight",
         type=float,
-        default=0.3,
-        help="Вес эмбеддинга названия при комбинированной классификации (по умолчанию 0.3)"
+        default=0.30,
+        help="Вес эмбеддинга названия при комбинированной классификации (по умолчанию 0.30)"
     )
 
     args = parser.parse_args()
@@ -170,7 +170,7 @@ def main():
     logger.info(f"Использование БД: {args.use_db}")
     logger.info(f"ID сессии: {args.session_id}")
     logger.info(
-        f"Веса классификации - документ: {args.document_weight:.1f}, название: {args.title_weight:.1f}")
+        f"Веса классификации - документ: {args.document_weight:.2f}, название: {args.title_weight:.2f}")
 
     # Проверка директории
     input_dir = Path(args.input_dir)

@@ -15,10 +15,12 @@ import uuid
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 import time
+import numpy as np
 
 # Импорт модулей проекта
 from modules.db import DB
 from modules.audit_standart import check_contract_standardness, STATUS_STANDARD, STATUS_NONSTANDARD, STATUS_UNKNOWN
+from modules.reranker_use import DocumentReranker, get_document_chunks_from_db, get_template_chunks_from_db
 
 
 def get_session_id() -> str:
@@ -48,7 +50,7 @@ def classify_similarity(similarity_score: Optional[float]) -> tuple[str, str]:
     elif 0.8 <= similarity_score < 0.9:
         return "🟡 Скорее всего соответствует предложенным шаблонам", "orange"
     else:
-        return "🔴 Скорее всего не соответствует ни одному шаблону (нестандартный)", "red"
+        return "🔴 Скорее всего не соответствует ни одному шаблону", "red"
 
 
 def get_classification_results(session_id: str) -> List[Dict[str, Any]]:
@@ -82,11 +84,95 @@ def get_all_templates() -> List[Dict[str, Any]]:
         return []
 
 
-def update_user_choice(doc_id: str, template_id: str) -> bool:
-    """Обновление выбора пользователя для документа."""
+def calculate_similarity(doc_embedding, template_embedding,
+                         doc_title_emb=None, template_title_emb=None,
+                         document_weight: float = 0.70, title_weight: float = 0.30) -> float:
+    """
+    Вычисление процента соответствия между документом и шаблоном.
+    Использует ту же логику, что и в classification.py
+
+    Args:
+        doc_embedding: эмбеддинг документа
+        template_embedding: эмбеддинг шаблона
+        doc_title_emb: эмбеддинг названия документа (опционально)
+        template_title_emb: эмбеддинг названия шаблона (опционально)
+        document_weight: вес документа (по умолчанию 0.70)
+        title_weight: вес названия (по умолчанию 0.30)
+
+    Returns:
+        float: процент соответствия от 0 до 1
+    """
+    import numpy as np
+
+    # Вычисляем косинусное сходство для документов
+    doc_similarity = np.dot(doc_embedding, template_embedding) / (
+        np.linalg.norm(doc_embedding) * np.linalg.norm(template_embedding)
+    )
+
+    # Если есть эмбеддинги названий, вычисляем их сходство
+    title_similarity = 0.0
+    if doc_title_emb is not None and template_title_emb is not None:
+        title_similarity = np.dot(doc_title_emb, template_title_emb) / (
+            np.linalg.norm(doc_title_emb) * np.linalg.norm(template_title_emb)
+        )
+
+    # Комбинированное сходство
+    combined_similarity = document_weight * \
+        doc_similarity + title_weight * title_similarity
+
+    return float(combined_similarity)
+
+
+def recalculate_similarity_for_template(doc_id: str, template_id: str) -> Optional[float]:
+    """
+    Пересчет процента соответствия для выбранного пользователем шаблона.
+
+    Args:
+        doc_id: ID документа
+        template_id: ID выбранного шаблона
+
+    Returns:
+        float: новый процент соответствия или None при ошибке
+    """
     try:
         db = DB()
-        return db.update_user_choice(doc_id, template_id)
+
+        # Получаем эмбеддинги документа
+        doc_embeddings = db.get_document_embeddings(doc_id)
+        if not doc_embeddings or doc_embeddings[0] is None:
+            st.error("Не удалось получить эмбеддинг документа")
+            return None
+
+        doc_emb, doc_title_emb = doc_embeddings
+
+        # Получаем эмбеддинги шаблона
+        template_embeddings = db.get_template_embeddings(template_id)
+        if not template_embeddings or template_embeddings[0] is None:
+            st.error("Не удалось получить эмбеддинг шаблона")
+            return None
+
+        template_emb, template_title_emb = template_embeddings
+
+        # Вычисляем новый процент соответствия
+        new_similarity = calculate_similarity(
+            doc_emb, template_emb,
+            doc_title_emb, template_title_emb,
+            document_weight=0.70,
+            title_weight=0.30
+        )
+
+        return new_similarity
+
+    except Exception as e:
+        st.error(f"Ошибка пересчета соответствия: {e}")
+        return None
+
+
+def update_user_choice(doc_id: str, template_id: str, new_similarity_score: float = None) -> bool:
+    """Обновление выбора пользователя для документа с пересчетом similarity_score."""
+    try:
+        db = DB()
+        return db.update_user_choice(doc_id, template_id, new_similarity_score)
     except Exception as e:
         st.error(f"Ошибка обновления выбора: {e}")
         return False
@@ -207,7 +293,7 @@ def run_classification(uploaded_files: List, temp_dir: str, session_id: str) -> 
             "python", "classification.py",
             "--input-dir", temp_dir,
             "--sbert-path", "./models/sbert_large_nlu_ru",
-            "--similar_id", "0.80",  # Обновленный порог по умолчанию
+            "--similar_id", "0.0",  # Обновленный порог по умолчанию
             "--embedding-dim", "1024",
             "--chunk-size", "350",
             "--batch-size", "16",  # Обновленный размер батча
@@ -291,6 +377,100 @@ def get_document_full_text(doc_id: str) -> Optional[str]:
         return None
 
 
+def match_chunks_with_reranker(doc_chunks: List[Dict], template_chunks: List[Dict]) -> List[Dict]:
+    """
+    Сопоставление чанков документа с чанками шаблона через reranker.
+
+    Args:
+        doc_chunks: чанки документа
+        template_chunks: чанки шаблона
+
+    Returns:
+        List[Dict]: список сопоставлений с ключами template_chunk, doc_chunk, score
+    """
+    if not doc_chunks or not template_chunks:
+        return []
+
+    try:
+        reranker = DocumentReranker(device="cpu")
+        if not reranker.is_available():
+            # Fallback: простое сопоставление по порядку
+            matches = []
+            for i, tmpl_chunk in enumerate(template_chunks):
+                doc_chunk = doc_chunks[i] if i < len(doc_chunks) else None
+                if doc_chunk:
+                    matches.append({
+                        "template_chunk": tmpl_chunk,
+                        "doc_chunk": doc_chunk,
+                        "score": 0.5
+                    })
+            return matches
+
+        # Используем reranker для сопоставления
+        matches = []
+        for tmpl_chunk in template_chunks:
+            best_match = None
+            best_score = 0.0
+
+            # Ищем лучший док-чанк для каждого чанка шаблона
+            for doc_chunk in doc_chunks:
+                pairs = [[tmpl_chunk["text"], doc_chunk["text"]]]
+                scores = reranker.model.predict(pairs, show_progress_bar=False)
+                # sigmoid normalization
+                score = float(1 / (1 + np.exp(-scores[0])))
+
+                if score > best_score:
+                    best_score = score
+                    best_match = doc_chunk
+
+            if best_match:
+                matches.append({
+                    "template_chunk": tmpl_chunk,
+                    "doc_chunk": best_match,
+                    "score": best_score
+                })
+
+        return matches
+    except Exception as e:
+        st.error(f"Ошибка сопоставления чанков: {e}")
+        return []
+
+
+def highlight_text_diff(text1: str, text2: str) -> str:
+    """
+    Пословное сравнение текстов с подсветкой различий желтым цветом.
+
+    Args:
+        text1: текст шаблона
+        text2: текст документа
+
+    Returns:
+        str: HTML с подсветкой различий
+    """
+    import difflib
+
+    words1 = text1.split()
+    words2 = text2.split()
+
+    diff = difflib.SequenceMatcher(None, words1, words2)
+    result = []
+
+    for tag, i1, i2, j1, j2 in diff.get_opcodes():
+        if tag == 'equal':
+            result.append(' '.join(words2[j1:j2]))
+        elif tag == 'replace':
+            result.append(
+                f'<mark style="background-color: yellow;">{" ".join(words2[j1:j2])}</mark>')
+        elif tag == 'insert':
+            result.append(
+                f'<mark style="background-color: yellow;">{" ".join(words2[j1:j2])}</mark>')
+        elif tag == 'delete':
+            # Удаленные слова не показываем в документе
+            pass
+
+    return ' '.join(result)
+
+
 def perform_standard_audit(doc_id: str) -> Optional[Dict[str, Any]]:
     """
     Выполнение анализа стандартности документа.
@@ -299,7 +479,7 @@ def perform_standard_audit(doc_id: str) -> Optional[Dict[str, Any]]:
         doc_id: Идентификатор документа
 
     Returns:
-        Dict: Результаты анализа с ключами 'status', 'violations', 'document_text'
+        Dict: Результаты анализа с ключами 'status', 'findings', 'document_text'
     """
     try:
         # Получаем полный текст документа
@@ -307,24 +487,40 @@ def perform_standard_audit(doc_id: str) -> Optional[Dict[str, Any]]:
         if not document_text:
             return {
                 'status': STATUS_UNKNOWN,
-                'violations': [],
+                'findings': [],
                 'document_text': '',
                 'error': 'Не удалось получить текст документа'
             }
 
-        # Выполняем анализ стандартности
-        status, violations = check_contract_standardness(document_text)
+        # Получаем информацию о документе для определения типа шаблона
+        doc_data = get_document_data(doc_id)
+        template_hint = None
+        if doc_data and doc_data.get('template_name'):
+            # Извлекаем тип шаблона из названия
+            template_name = doc_data['template_name']
+            if 'поставк' in template_name.lower():
+                template_hint = 'Поставка'
+            elif 'услуг' in template_name.lower():
+                template_hint = 'Услуги'
+            elif 'подряд' in template_name.lower():
+                template_hint = 'Подряд'
+            elif 'рамочн' in template_name.lower():
+                template_hint = 'Рамочный'
+
+        # Выполняем анализ стандартности с подсказкой типа шаблона
+        status, findings = check_contract_standardness(
+            document_text, template_hint=template_hint)
 
         return {
             'status': status,
-            'violations': violations,
+            'findings': findings,
             'document_text': document_text,
             'error': None
         }
     except Exception as e:
         return {
             'status': STATUS_UNKNOWN,
-            'violations': [],
+            'findings': [],
             'document_text': '',
             'error': str(e)
         }
@@ -373,7 +569,7 @@ def show_audit_mode():
         return
 
     status = audit_results['status']
-    violations = audit_results['violations']
+    findings = audit_results.get('findings', [])
 
     # Отображение статуса с соответствующим цветом
     st.write("**🎯 Заключение о стандартности:**")
@@ -391,49 +587,40 @@ def show_audit_mode():
             "Не удалось определить соответствие стандартной форме из-за недостатка информации или особенностей текста.")
 
     # Сводка (перенесена в раздел "Информация")
-    if violations:
+    if findings:
         st.write("**📊 Сводка:**")
         col_summary1, col_summary2, col_summary3 = st.columns(3)
 
         with col_summary1:
-            st.metric("Общее количество нарушений", len(violations))
+            st.metric("Общее количество нарушений", len(findings))
 
-        # Категоризация нарушений
+        # Категоризация нарушений по severity и rule_name
         categories = {}
-        for violation in violations:
-            desc = violation['description']
-            if "срок действия" in desc.lower():
-                categories['Срок действия'] = categories.get(
-                    'Срок действия', 0) + 1
-            elif "срок оплаты" in desc.lower():
-                categories['Условия оплаты'] = categories.get(
-                    'Условия оплаты', 0) + 1
-            elif "предоплат" in desc.lower() or "аванс" in desc.lower():
-                categories['Предоплата'] = categories.get('Предоплата', 0) + 1
-            elif "приемки" in desc.lower():
-                categories['Приемка работ'] = categories.get(
-                    'Приемка работ', 0) + 1
-            elif "платежный день" in desc.lower():
-                categories['Платежные дни'] = categories.get(
-                    'Платежные дни', 0) + 1
-            elif "протокол разноглас" in desc.lower():
-                categories['Протокол разногласий'] = categories.get(
-                    'Протокол разногласий', 0) + 1
-            else:
-                categories['Прочие'] = categories.get('Прочие', 0) + 1
+        severity_counts = {'critical': 0, 'major': 0, 'minor': 0}
+
+        for finding in findings:
+            # Подсчет по severity
+            severity = finding.get('severity', 'minor')
+            severity_counts[severity] = severity_counts.get(severity, 0) + 1
+
+            # Подсчет по категориям
+            rule_name = finding.get('rule_name', 'Прочие')
+            categories[rule_name] = categories.get(rule_name, 0) + 1
 
         with col_summary2:
-            if categories:
-                st.write("**Категории нарушений:**")
-                # Показываем первые 3 категории
-                for category, count in list(categories.items())[:3]:
-                    st.write(f"• {category}: {count}")
+            st.write("**По критичности:**")
+            if severity_counts['critical'] > 0:
+                st.write(f"🔴 Критические: {severity_counts['critical']}")
+            if severity_counts['major'] > 0:
+                st.write(f"🟠 Важные: {severity_counts['major']}")
+            if severity_counts['minor'] > 0:
+                st.write(f"🟡 Незначительные: {severity_counts['minor']}")
 
         with col_summary3:
-            if len(categories) > 3:
-                st.write("**Дополнительно:**")
-                # Показываем остальные категории
-                for category, count in list(categories.items())[3:]:
+            if categories:
+                st.write("**По категориям:**")
+                # Показываем первые 3 категории
+                for category, count in list(categories.items())[:3]:
                     st.write(f"• {category}: {count}")
     else:
         st.write("**📊 Сводка:**")
@@ -497,16 +684,307 @@ def show_audit_mode():
         """)
 
     # Детали нарушений (если есть)
-    if violations:
+    if findings:
         st.markdown("---")
         st.subheader("🚨 Выявленные нарушения")
 
-        for i, violation in enumerate(violations, 1):
-            with st.expander(f"Нарушение {i}: {violation['description']}", expanded=True):
-                if violation['found_text']:
-                    st.code(violation['found_text'], language='text')
+        # Группируем findings по severity для лучшей организации
+        critical_findings = [
+            f for f in findings if f.get('severity') == 'critical']
+        major_findings = [f for f in findings if f.get('severity') == 'major']
+        minor_findings = [f for f in findings if f.get('severity') == 'minor']
+
+        # Сначала показываем критические
+        if critical_findings:
+            st.error("**🔴 Критические нарушения:**")
+            for finding in critical_findings:
+                with st.expander(f"{finding['rule_id']}: {finding['rule_name']}", expanded=True):
+                    # Показываем абзац с HTML подсветкой
+                    st.markdown(finding.get('paragraph_html', finding.get(
+                        'paragraph_text', '')), unsafe_allow_html=True)
+
+                    # Показываем дополнительные детали, если есть
+                    if finding.get('details'):
+                        st.json(finding['details'])
+
+        # Затем важные
+        if major_findings:
+            st.warning("**🟠 Важные нарушения:**")
+            for finding in major_findings:
+                with st.expander(f"{finding['rule_id']}: {finding['rule_name']}", expanded=False):
+                    # Показываем абзац с HTML подсветкой
+                    st.markdown(finding.get('paragraph_html', finding.get(
+                        'paragraph_text', '')), unsafe_allow_html=True)
+
+                    # Показываем дополнительные детали, если есть
+                    if finding.get('details'):
+                        st.json(finding['details'])
+
+        # И незначительные
+        if minor_findings:
+            st.info("**🟡 Незначительные нарушения:**")
+            for finding in minor_findings:
+                with st.expander(f"{finding['rule_id']}: {finding['rule_name']}", expanded=False):
+                    # Показываем абзац с HTML подсветкой
+                    st.markdown(finding.get('paragraph_html', finding.get(
+                        'paragraph_text', '')), unsafe_allow_html=True)
+
+                    # Показываем дополнительные детали, если есть
+                    if finding.get('details'):
+                        st.json(finding['details'])
+
+    st.markdown("---")
+
+    # Новый раздел: Детальное сравнение документа и шаблона
+    with st.expander("📊 Детальное сравнение документа и шаблона", expanded=False):
+        if not doc_data.get('template_id'):
+            st.warning(
+                "🟡 Для детального сравнения необходимо выбрать и подтвердить шаблон")
+        else:
+            # Таймер для оценки времени обработки
+            start_time = time.time()
+
+            with st.spinner("Загрузка и сопоставление чанков..."):
+                # Получаем чанки
+                db = DB()
+                doc_chunks = get_document_chunks_from_db(
+                    db, doc_data['doc_id'])
+                template_chunks = get_template_chunks_from_db(
+                    db, doc_data['template_id'])
+
+                if not doc_chunks or not template_chunks:
+                    st.error("🔴 Не удалось загрузить чанки для сравнения")
                 else:
-                    st.write("*Текст не найден в документе*")
+                    # Сопоставляем чанки через reranker
+                    matches = match_chunks_with_reranker(
+                        doc_chunks, template_chunks)
+
+                    # Вычисляем время обработки
+                    processing_time = time.time() - start_time
+
+                    if not matches:
+                        st.error("🔴 Не удалось сопоставить чанки")
+                    else:
+                        # Отображаем время обработки
+                        st.success(
+                            f"⏱️ Время обработки: {processing_time:.2f} секунд")
+
+                        # Общая информация о сопоставлении
+                        st.info(f"📊 **Статистика сопоставления:**")
+                        col_info1, col_info2, col_info3 = st.columns(3)
+
+                        with col_info1:
+                            st.metric("Чанков документа", len(doc_chunks))
+                        with col_info2:
+                            st.metric("Чанков шаблона", len(template_chunks))
+                        with col_info3:
+                            st.metric("Сопоставлений", len(matches))
+                        # Фильтр: показывать только чанки с расхождениями
+                        show_only_diff = st.checkbox(
+                            "Показать только чанки с расхождениями", value=True)
+
+                        st.write(
+                            f"**Всего пар для сравнения:** {len(matches)}")
+
+                        # Хранилище для отредактированных чанков
+                        if 'edited_chunks' not in st.session_state:
+                            st.session_state.edited_chunks = {}
+
+                        # Счетчик для отображаемых чанков
+                        displayed_count = 0
+
+                        # Проходим по всем сопоставлениям
+                        for idx, match in enumerate(matches):
+                            tmpl_chunk = match['template_chunk']
+                            doc_chunk = match['doc_chunk']
+                            score = match['score']
+
+                            # Проверяем, есть ли расхождения
+                            has_diff = tmpl_chunk['text'].strip(
+                            ) != doc_chunk['text'].strip()
+
+                            # Фильтрация
+                            if show_only_diff and not has_diff and score > 0.95:
+                                continue
+
+                            # Проверяем, есть ли нарушения в этом чанке
+                            violations_for_chunk = []
+                            for finding in findings:
+                                # Сопоставляем по тексту параграфа
+                                para_text = finding.get('paragraph_text', '')
+                                if para_text and para_text in doc_chunk['text']:
+                                    violations_for_chunk.append(finding)
+
+                            displayed_count += 1
+
+                            # Заголовок чанка с дополнительной информацией
+                            heading = tmpl_chunk.get(
+                                'heading', f'Чанк {idx + 1}')
+                            st.markdown(f"### 📋 {heading}")
+
+                            # Информация о сопоставлении
+                            col_score, col_diff = st.columns([1, 2])
+                            with col_score:
+                                st.caption(f"🎯 Соответствие: {score*100:.1f}%")
+                            with col_diff:
+                                if has_diff:
+                                    st.caption("⚠️ Обнаружены различия")
+                                else:
+                                    st.caption("✅ Тексты идентичны")
+
+                            # 3 колонки с полным отображением
+                            col1, col2, col3 = st.columns([1, 1, 1])
+
+                            # Колонка 1: Шаблон (полный текст)
+                            with col1:
+                                st.markdown("**🔹 Текст шаблона:**")
+                                st.text_area(
+                                    "Шаблон",
+                                    value=tmpl_chunk['text'],
+                                    height=300,
+                                    key=f"template_{idx}",
+                                    disabled=True,
+                                    label_visibility="collapsed",
+                                    help="Полный текст чанка из выбранного шаблона"
+                                )
+
+                                # Дополнительная информация о шаблоне
+                                st.caption(
+                                    f"📏 Длина: {len(tmpl_chunk['text'])} символов")
+                                if tmpl_chunk.get('ord'):
+                                    st.caption(
+                                        f"🔢 Порядок: {tmpl_chunk['ord']}")
+
+                            # Колонка 2: Документ (полный текст с подсветкой и редактированием)
+                            with col2:
+                                st.markdown("**📄 Текст документа:**")
+
+                                # Подсветка различий (полный текст)
+                                highlighted_text = highlight_text_diff(
+                                    tmpl_chunk['text'], doc_chunk['text'])
+                                st.markdown(highlighted_text,
+                                            unsafe_allow_html=True)
+
+                                st.markdown("**✏️ Редактирование:**")
+                                # Получаем текущий текст (отредактированный или оригинальный)
+                                chunk_key = doc_chunk['chunk_id']
+                                current_text = st.session_state.edited_chunks.get(
+                                    chunk_key,
+                                    doc_chunk['text']
+                                )
+
+                                edited_text = st.text_area(
+                                    "Редактировать текст документа",
+                                    value=current_text,
+                                    height=200,
+                                    key=f"edit_{idx}",
+                                    label_visibility="collapsed",
+                                    help="Отредактируйте текст документа. Изменения будут сохранены при нажатии кнопки 'Сохранить все изменения'"
+                                )
+
+                                # Сохраняем изменения в session_state
+                                if edited_text != doc_chunk['text']:
+                                    st.session_state.edited_chunks[chunk_key] = edited_text
+
+                                # Дополнительная информация о документе
+                                st.caption(
+                                    f"📏 Длина: {len(doc_chunk['text'])} символов")
+                                if doc_chunk.get('ord'):
+                                    st.caption(
+                                        f"🔢 Порядок: {doc_chunk['ord']}")
+
+                                # Индикатор изменений
+                                if edited_text != doc_chunk['text']:
+                                    st.success("📝 Текст изменен")
+
+                            # Колонка 3: Нарушения стандартности (полная информация)
+                            with col3:
+                                st.markdown("**⚠️ Анализ стандартности:**")
+
+                                if violations_for_chunk:
+                                    st.error(
+                                        f"🔴 Найдено нарушений: {len(violations_for_chunk)}")
+
+                                    for i, violation in enumerate(violations_for_chunk):
+                                        with st.expander(f"Нарушение {i+1}: {violation['rule_id']}", expanded=False):
+                                            st.error(
+                                                f"**Правило:** {violation['rule_name']}")
+                                            st.write(
+                                                f"**Описание:** {violation.get('description', 'Нет описания')}")
+
+                                            # Показываем полный текст параграфа с нарушением
+                                            if violation.get('paragraph_html'):
+                                                st.markdown(
+                                                    "**Текст с нарушением:**")
+                                                st.markdown(
+                                                    violation['paragraph_html'], unsafe_allow_html=True)
+                                            elif violation.get('paragraph_text'):
+                                                st.markdown(
+                                                    "**Текст с нарушением:**")
+                                                st.text_area(
+                                                    "Параграф с нарушением",
+                                                    value=violation['paragraph_text'],
+                                                    height=150,
+                                                    disabled=True,
+                                                    key=f"violation_{idx}_{i}",
+                                                    label_visibility="collapsed"
+                                                )
+
+                                            # Дополнительные детали
+                                            if violation.get('details'):
+                                                st.json(violation['details'])
+                                else:
+                                    st.success("✅ Нарушений не обнаружено")
+                                    st.info(
+                                        "Данный чанк соответствует стандартным требованиям")
+
+                            st.markdown("---")
+
+                        st.info(
+                            f"Отображено чанков: {displayed_count} из {len(matches)}")
+
+                        # Кнопка сохранения изменений
+                        if st.session_state.edited_chunks:
+                            st.markdown("### 💾 Сохранить изменения")
+                            col_save1, col_save2 = st.columns([1, 3])
+
+                            with col_save1:
+                                if st.button("💾 Сохранить все изменения", type="primary"):
+                                    # Подготавливаем данные для сохранения
+                                    chunks_to_save = []
+                                    for chunk in doc_chunks:
+                                        chunk_id = chunk['chunk_id']
+                                        edited_text = st.session_state.edited_chunks.get(
+                                            chunk_id, chunk['text'])
+                                        is_modified = edited_text != chunk['text']
+
+                                        chunks_to_save.append({
+                                            "chunk_id": chunk_id,
+                                            "ord": chunk['ord'],
+                                            "heading": chunk.get('heading', ''),
+                                            "original_text": chunk['text'],
+                                            "edited_text": edited_text,
+                                            "is_modified": is_modified
+                                        })
+
+                                    # Сохраняем в БД
+                                    if db.save_edited_chunks(doc_data['doc_id'], chunks_to_save):
+                                        st.success(
+                                            "✅ Изменения успешно сохранены!")
+                                        # Очищаем session_state
+                                        st.session_state.edited_chunks = {}
+                                        time.sleep(1)
+                                        st.rerun()
+                                    else:
+                                        st.error(
+                                            "🔴 Ошибка при сохранении изменений")
+
+                            with col_save2:
+                                st.info(
+                                    f"📝 Изменено чанков: {len(st.session_state.edited_chunks)}")
+
+    st.markdown("---")
+
 
 # Сводка и заключение теперь находятся в разделе "Информация"
 
@@ -700,7 +1178,7 @@ def main():
         st.markdown("---")
 
         # st.header("🔄 Загрузка документов")
-        st.info("Загрузка документов")
+        st.info("**Загрузка документов**")
 
         uploaded_files = st.file_uploader(
             "Выберите документы для классификации",
@@ -713,20 +1191,20 @@ def main():
             st.write(f"📁 Загружено файлов: {len(uploaded_files)}")
             for file in uploaded_files:
                 st.write(f"• {file.name}")
-
+        # 🚀
         process_button = st.button(
-            "🚀 Обработать документы",
+            "**Обработать документы**",
             disabled=not uploaded_files,
             type="primary"
         )
         # Для управления данными разблокировать
 
-        # # Кнопка очистки данных сессии
-        # st.markdown("---")
+        # Кнопка очистки данных сессии
+        st.markdown("---")
         # st.subheader("🗑️ Управление данными")
-        # if st.button("🗑️ Очистить данные сессии", help="Удалить все данные текущей сессии"):
-        #     if clear_session_data(session_id):
-        #         st.rerun()
+        if st.button("**Очистить данные сессии**", help="Удалить все данные текущей сессии"):
+            if clear_session_data(session_id):
+                st.rerun()
 
     # Основная область
     col1, col2 = st.columns([2, 1])
@@ -875,12 +1353,26 @@ def main():
                             help="Нажимая кнопку вы подтверждаете шаблон, дальнейшая работа будет основана с применением выбранного шаблона"
                         ):
                             if selected_template_id:
-                                if update_user_choice(result['doc_id'], selected_template_id):
-                                    st.success(
-                                        f"🟢 Шаблон подтвержден для документа {result['doc_name']}")
-                                    st.rerun()
+                                # Пересчитываем процент соответствия для выбранного шаблона
+                                with st.spinner("Пересчет процента соответствия..."):
+                                    new_similarity = recalculate_similarity_for_template(
+                                        result['doc_id'], selected_template_id
+                                    )
+
+                                if new_similarity is not None:
+                                    # Обновляем выбор пользователя и similarity_score
+                                    if update_user_choice(result['doc_id'], selected_template_id, new_similarity):
+                                        st.success(
+                                            f"🟢 Шаблон подтвержден для документа {result['doc_name']}")
+                                        st.info(
+                                            f"Новый процент соответствия: {new_similarity*100:.1f}%")
+                                        st.rerun()
+                                    else:
+                                        st.error(
+                                            "🔴 Ошибка при сохранении выбора")
                                 else:
-                                    st.error("🔴 Ошибка при сохранении выбора")
+                                    st.error(
+                                        "🔴 Ошибка при пересчете процента соответствия")
                             else:
                                 st.warning(
                                     "🟡 Выберите шаблон для подтверждения")
@@ -982,11 +1474,10 @@ def main():
 
         • **90-100%** - Документ соответствует найденному шаблону\n
         • **80-90%** - Документ скорее всего соответствует предложенным шаблонам\n  
-        • **0-80%** - Документ скорее всего не соответствует ни одному шаблону (нестандартный)\n
-        • **0% (null)** - Затрудняюсь ответить\n
+        • **0-80%** - Документ скорее всего не соответствует ни одному шаблону\n
+        • **0%** - Затрудняюсь ответить\n
         
         **Особенности:** Система всегда находит наиболее похожий шаблон с реальным процентом схожести.\n
-        Порог классификации: 80% (документы с меньшей схожестью считаются неклассифицированными).
         """)
 
         # st.info("Настройки")

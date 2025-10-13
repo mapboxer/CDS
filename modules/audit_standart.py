@@ -1,455 +1,522 @@
-"""
-Module: contract_standard_checker
-Description: Provides functionality to determine if a given contract text follows the standard form.
-The module analyzes the text of a contract and checks it against a set of predefined rules/conditions.
-It returns a status (СТАНДАРТНЫЙ, НЕ СТАНДАРТНЫЙ, НЕ МОГУ ОПРЕДЕЛИТЬ) and a list of any violated conditions with their locations in the text.
-"""
+# -*- coding: utf-8 -*-
+from __future__ import annotations
+import os
 import re
-import datetime
+import json
+import datetime as dt
+from dataclasses import dataclass, field
+from typing import List, Dict, Any, Optional, Tuple
 
-# Define possible output statuses
 STATUS_STANDARD = "СТАНДАРТНЫЙ"
 STATUS_NONSTANDARD = "НЕ СТАНДАРТНЫЙ"
 STATUS_UNKNOWN = "НЕ МОГУ ОПРЕДЕЛИТЬ"
 
-# Define month name mapping for parsing dates (genitive case in Russian to month number)
-MONTH_MAP = {
-    "января": 1, "февраля": 2, "марта": 3, "апреля": 4,
-    "мая": 5, "июня": 6, "июля": 7, "августа": 8,
-    "сентября": 9, "октября": 10, "ноября": 11, "декабря": 12
+DEFAULT_CONFIG_PATH = os.environ.get(
+    "CDS_AUDIT_RULES", "configs/audit_rules.yaml")
+
+# Optional: spaCy NER (ru_core_news_sm / md)
+_SPACY_NLP = None
+try:
+    import spacy  # type: ignore
+    _SPACY_MODEL = os.environ.get("CDS_SPACY_MODEL", "ru_core_news_md")
+    try:
+        _SPACY_NLP = spacy.load(_SPACY_MODEL)
+    except Exception:
+        _SPACY_NLP = None
+except Exception:
+    _SPACY_NLP = None
+
+# Optional: CrossEncoder reranker
+_RERANKER = None
+try:
+    from sentence_transformers import CrossEncoder  # type: ignore
+    _RERANKER_PATH = os.environ.get("CDS_RERANKER_PATH", "models/reranker_ru")
+    if os.path.isdir(_RERANKER_PATH):
+        _RERANKER = CrossEncoder(_RERANKER_PATH)
+except Exception:
+    _RERANKER = None
+
+_MONTHS = {
+    "январ": 1, "феврал": 2, "март": 3, "апрел": 4, "мая": 5, "май": 5, "июн": 6,
+    "июл": 7, "август": 8, "сентябр": 9, "октябр": 10, "ноябр": 11, "декабр": 12,
 }
 
 
-def check_contract_standardness(contract_text: str):
-    """
-    Analyze the given contract text and determine if it conforms to the standard form.
-    Returns a tuple: (status, violations), where status is one of:
-        "СТАНДАРТНЫЙ" (standard),
-        "НЕ СТАНДАРТНЫЙ" (non-standard),
-        "НЕ МОГУ ОПРЕДЕЛИТЬ" (cannot determine).
-    violations is a list of dictionaries, each containing:
-        "description": description of the violated condition (in Russian),
-        "found_text": excerpt of the contract where the violation was detected.
-    If no violations are found, the violations list will be empty.
-    """
-    text = contract_text
-    if text is None or text.strip() == "":
-        # If there is no text to analyze, we cannot determine the status
-        return STATUS_UNKNOWN, []
-    if len(text) < 50:
-        # Text is too short to be a full contract – likely insufficient information
-        return STATUS_UNKNOWN, []
+def _to_date(s: str) -> Optional[dt.date]:
+    s = s.strip().lower().replace("г.", "").replace("года", "").strip()
+    m = re.match(r"(\d{1,2})[./](\d{1,2})[./](\d{2,4})", s)
+    if m:
+        d, mo, y = map(int, m.groups())
+        if y < 100:
+            y += 2000
+        try:
+            return dt.date(y, mo, d)
+        except ValueError:
+            return None
+    m = re.match(r"(\d{1,2})\s+([а-яё]+)\s+(\d{4})", s, re.I)
+    if m:
+        d = int(m.group(1))
+        mon = m.group(2).lower()
+        for key, val in _MONTHS.items():
+            if mon.startswith(key):
+                try:
+                    return dt.date(int(m.group(3)), val, d)
+                except ValueError:
+                    return None
+    return None
 
-    text_lower = text.lower()
-    violations = []  # List to collect any violation details
 
-    # 1. Проверка формы и шаблона договора
-    # Проверка на использование формы контрагента или упоминание протокола разногласий
-    form_keywords = [
-        "по форме контрагента", "форме поставщика", "форме подрядчика",
-        "форме исполнителя", "не по форме, утверждённой"
-    ]
+def _days_between(a: Optional[dt.date], b: Optional[dt.date]) -> Optional[int]:
+    if a and b:
+        return (b - a).days
+    return None
 
-    for keyword in form_keywords:
-        if keyword in text_lower:
-            idx = text_lower.find(keyword)
-            sent_start = max(0, text.rfind('.', 0, idx) + 1)
-            sent_end = text.find('.', idx)
-            if sent_end == -1:
-                sent_end = min(idx + 100, len(text))
-            violations.append({
-                "description": f"Договор составлен по форме контрагента, а не по утвержденной стандартной форме",
-                "found_text": text[sent_start:sent_end].strip()
-            })
-            break
 
-    # 2. Проверка срока действия договора (≤ 3 лет, без автопролонгации и бессрочности).
-    term_clause = None
-    term_idx = text_lower.find("срок действия")
-    if term_idx != -1:
-        # Extract the sentence or line containing "срок действия"
-        end_idx = text.find('.', term_idx)
-        nl_idx = text.find('\n', term_idx)
-        if end_idx == -1 or (nl_idx != -1 and nl_idx < end_idx):
-            end_idx = nl_idx
-        if end_idx == -1:
-            end_idx = len(text)
-        term_clause = text[term_idx:end_idx].strip()
-    else:
-        # If "срок действия" not found, look for a phrase like "договор действует ..."
-        act_idx = text_lower.find("договор действует")
-        if act_idx != -1:
-            end_idx = text.find('.', act_idx)
-            nl_idx = text.find('\n', act_idx)
-            if end_idx == -1 or (nl_idx != -1 and nl_idx < end_idx):
-                end_idx = nl_idx
-            if end_idx == -1:
-                end_idx = len(text)
-            term_clause = text[act_idx:end_idx].strip()
-    # Analyze the identified term clause
-    if term_clause:
-        clause_lower = term_clause.lower()
-        # Look for forbidden terms indicating indefinite duration or auto-extension
-        if ("бессроч" in clause_lower) or ("автоматическ" in clause_lower) or ("пролонгац" in clause_lower) or ("полного выполн" in clause_lower):
-            violations.append({
-                "description": "Срок действия договора не ограничен 3 годами (бессрочный или с автоматической пролонгацией)",
-                "found_text": term_clause
-            })
-        else:
-            # Check for explicit duration in years or months (but not calendar years like "2027 года")
-            # Ищем конструкции типа "5 лет", "36 месяцев", но не "2027 года"
-            dur_match = re.search(
-                r'(?:^|[^0-9])(\d{1,2})\s*(?:год[а-я]*|лет|месяц[а-я]*)', clause_lower)
-            if dur_match:
-                num = int(dur_match.group(1))
-                unit = dur_match.group(0)  # e.g., "5 лет" or "48 месяцев"
-                # Проверяем, что это именно срок, а не календарный год (например "2027 года")
-                if num > 100:  # Если число больше 100, это скорее всего календарный год
-                    pass  # Игнорируем календарные годы
-                elif "месяц" in unit:
-                    # Duration given in months
-                    if num > 36:
-                        violations.append({
-                            "description": f"Срок действия договора превышает 3 года ({num} мес.)",
-                            "found_text": term_clause
-                        })
-                else:
-                    # Duration given in years
-                    if num > 3:
-                        violations.append({
-                            "description": f"Срок действия договора превышает 3 года ({num} года)",
-                            "found_text": term_clause
-                        })
-            else:
-                # Check for an explicit end date in the clause (e.g., "до 31.12.2028")
-                date_match = re.search(
-                    r'(?:до|по)\s+(\d{1,2}\.\d{1,2}\.(20\d\d))', clause_lower)
-                date_obj = None
-                if date_match:
-                    date_str = date_match.group(1)
-                    try:
-                        date_obj = datetime.datetime.strptime(
-                            date_str, "%d.%m.%Y")
-                    except ValueError:
-                        date_obj = None
-                else:
-                    # Try matching a date with month name (e.g., "до 31 декабря 2028")
-                    date_match2 = re.search(
-                        r'(?:до|по)\s+(\d{1,2})\s+([а-я]+)\s+(20\d\d)', clause_lower)
-                    if date_match2:
-                        day = int(date_match2.group(1))
-                        month_name = date_match2.group(2)
-                        year = int(date_match2.group(3))
-                        month_num = MONTH_MAP.get(month_name)
-                        if month_num:
-                            try:
-                                date_obj = datetime.datetime(
-                                    year, month_num, day)
-                            except ValueError:
-                                date_obj = None
-                if date_obj:
-                    # Compare end date with today's date to estimate duration
-                    today = datetime.datetime.now()
-                    # Проверяем, что срок не превышает 3 года от текущей даты
-                    max_allowed_date = today + datetime.timedelta(days=3*365)
-                    if date_obj > max_allowed_date:
-                        years_diff = (date_obj - today).days / 365
-                        violations.append({
-                            "description": f"Срок действия договора превышает 3 года ({years_diff:.1f} года до {date_obj.strftime('%d.%m.%Y')})",
-                            "found_text": term_clause
-                        })
-                else:
-                    # No explicit duration or date found (term possibly not specified -> considered indefinite)
-                    violations.append({
-                        "description": "Срок действия договора не указан явно (нет конкретной конечной даты)",
-                        "found_text": term_clause
-                    })
-    else:
-        # No contract term clause found at all
-        violations.append({
-            "description": "Срок действия договора не указан",
-            "found_text": ""
-        })
-
-    # 3. Проверка срока оплаты (≥ 60 календарных дней, если иное не требует закон) и отсутствия предоплаты.
-    payment_term_found = False
-    payment_clause = None
-    # Regex to find payment term (number of days) - more flexible pattern
-    pay_pattern = re.compile(
-        r'(?:течение|срок|в)\s+(\d+)\s+(календарн\w*|рабочих?)\s+дн\w*', flags=re.IGNORECASE)
-    pay_match = pay_pattern.search(text)
-    if pay_match:
-        payment_term_found = True
-        days = int(pay_match.group(1))
-        match_text = pay_match.group(0)
-        payment_clause = match_text
-        # Determine if "рабочих дней" was specified
-        is_working = "рабочих" in match_text.lower()
-        if is_working:
-            # Convert working days to approximate calendar days (5 work days ≈ 7 calendar days)
-            if days < 43:  # 42 рабочие дни ≈ 60 календарных дней
-                violations.append({
-                    "description": f"Срок оплаты установлен менее 60 календарных дней ({days} рабочих дн.)",
-                    "found_text": match_text
-                })
-        else:
-            if days < 60:
-                # Check context for references to law (to allow exception if law mandates shorter term)
-                context_start = max(0, pay_match.start() - 50)
-                context_end = min(len(text), pay_match.end() + 50)
-                context = text_lower[context_start:context_end]
-                if "закона" in context or " фз" in context or "федерального закона" in context:
-                    # If the clause explicitly references a law (RF legislation) for this term, do not flag as violation
-                    pass
-                else:
-                    violations.append({
-                        "description": f"Срок оплаты установлен менее 60 календарных дней ({days} дн.)",
-                        "found_text": match_text
-                    })
-    # If no numeric payment term found, search for spelled-out terms
-    if not payment_term_found:
-        for line in text.splitlines():
-            line_low = line.lower()
-            if ("оплат" in line_low or "платеж" in line_low or "расчет" in line_low) and ("дней" in line_low or "дня" in line_low):
-                if re.search(r'\d', line_low):
-                    # skip lines that already contain a digit (would have been caught above)
-                    continue
-                if "шестидесяти" in line_low:
-                    # "шестидесяти дней" (60 days) spelled out
-                    payment_term_found = True
-                    payment_clause = line.strip()
-                    # 60 days (or more) is compliant, so no violation added
-                    continue
-                # Check for spelled numbers indicating <60 days (e.g., "тридцати дней" = 30 days, "сорока пяти дней" = 45 days)
-                if any(word in line_low for word in ["двадцати", "тридцати", "сорока", "пятидесяти"]):
-                    payment_term_found = True
-                    payment_clause = line.strip()
-                    # Determine specific number for description if possible
-                    desc = None
-                    if "сорока пяти" in line_low:
-                        desc = "45 дней"
-                    elif "сорока" in line_low and "сорока пяти" not in line_low:
-                        desc = "40 дней"
-                    elif "тридцати пяти" in line_low:
-                        desc = "35 дней"
-                    elif "тридцати" in line_low and "тридцати пяти" not in line_low:
-                        desc = "30 дней"
-                    elif "пятидесяти" in line_low:
-                        desc = "50 дней"
-                    elif "двадцати" in line_low:
-                        desc = "20 дней"
-                    violations.append({
-                        "description": f"Срок оплаты установлен менее 60 календарных дней ({desc if desc else 'менее 60 дней'})",
-                        "found_text": line.strip()
-                    })
-    if not payment_term_found:
-        # If we found no mention of payment timing at all, mark as missing info (non-standard)
-        violations.append({
-            "description": "Условие о сроке оплаты не найдено",
-            "found_text": ""
-        })
-
-    # Check for prepayment (предоплата/аванс)
-    # Согласно п.4 чек-листа, предоплата допустима только при соблюдении требований п. 6.6
-    for m in re.finditer(r'предоплат|аванс', text_lower):
-        idx = m.start()
-        # Determine sentence or line boundaries around the found word
-        sent_start = text.rfind('.', 0, idx)
-        line_start = text.rfind('\n', 0, idx)
-        start_idx = max(sent_start, line_start)
-        if start_idx == -1:
-            start_idx = 0
-        else:
-            start_idx += 1  # skip the delimiter
-        sent_end = text.find('.', idx)
-        line_end = text.find('\n', idx)
-        end_idx = sent_end
-        if end_idx == -1 or (line_end != -1 and line_end < end_idx):
-            end_idx = line_end
-        if end_idx == -1:
-            end_idx = len(text)
-        sentence = text_lower[start_idx:end_idx] if start_idx < end_idx else text_lower[start_idx:]
-
-        # If the sentence contains negation (e.g., "не предусмотрена предоплата" or "без предоплаты"), skip violation.
-        if sentence and (("без предоплат" in sentence) or ("без аванс" in sentence) or ("не " in sentence)):
+def _split_paragraphs(text: str) -> List[str]:
+    parts = re.split(r"\n\s*\n|(?:\r?\n){1,}", text.strip())
+    merged: List[str] = []
+    buf = ""
+    for p in parts:
+        st = p.strip()
+        if not st:
             continue
-
-        # Check if prepayment conditions p.6.6 are mentioned (банковская гарантия, аккредитация, одобрения)
-        p66_keywords = ["банковская гарантия", "банковской гарантии",
-                        "аккредитация", "одобрен", "полномочи"]
-        has_p66_conditions = any(
-            keyword in text_lower for keyword in p66_keywords)
-
-        if has_p66_conditions:
-            # Предоплата с упоминанием условий п.6.6 - требует дополнительной проверки
-            violations.append({
-                "description": "Предоплата требует проверки соблюдения всех условий п.6.6 (банковская гарантия, аккредитация, одобрения и др.)",
-                "found_text": text[start_idx:end_idx].strip()
-            })
+        if len(st) < 80 and buf:
+            buf += " " + st
         else:
-            # Предоплата без упоминания условий п.6.6 - нарушение
-            violations.append({
-                "description": "Предусмотрена предоплата без соблюдения требований п.6.6 (отсутствуют банковская гарантия, аккредитация, одобрения)",
-                "found_text": text[start_idx:end_idx].strip()
-            })
-        break  # one instance is enough to flag
+            if buf:
+                merged.append(buf)
+            buf = st
+    if buf:
+        merged.append(buf)
+    return merged if merged else ([text.strip()] if text.strip() else [])
 
-    # 4. Проверка срока приемки работ/услуг (≥ 5 рабочих дней).
-    # Only enforce if contract involves works/services (Компания как заказчик услуг/работ).
-    has_services = ("услуг" in text_lower or "работ" in text_lower)
-    if has_services:
-        accept_pattern = re.compile(
-            r'(?:прием|акт)[^.\n]*?(\d+)\s*рабочих?\s*дн', flags=re.IGNORECASE)
-        acc_match = accept_pattern.search(text)
-        if acc_match:
-            days = int(acc_match.group(1))
-            match_text = acc_match.group(0)
-            if days < 5:
-                violations.append({
-                    "description": f"Срок приемки результатов работ/услуг менее 5 рабочих дней ({days} дн.)",
-                    "found_text": match_text
-                })
+
+def _iter_matches(pattern: str, text: str) -> List[Tuple[int, int]]:
+    spans = []
+    for m in re.finditer(pattern, text, flags=re.I | re.M):
+        spans.append((m.start(), m.end()))
+    return spans
+
+
+def _highlight(text: str, spans: List[Tuple[int, int]]) -> str:
+    if not spans:
+        return text
+    spans = sorted(spans)
+    merged = []
+    cur_s, cur_e = spans[0]
+    for s, e in spans[1:]:
+        if s <= cur_e:
+            cur_e = max(cur_e, e)
         else:
-            violations.append({
-                "description": "Срок приемки работ/услуг не указан (требуется ≥ 5 рабочих дней)",
-                "found_text": ""
-            })
-    # If the contract is only for goods (no "услуг" or "работ"), the 5-day acceptance rule may not apply – we skip in that case.
+            merged.append((cur_s, cur_e))
+            cur_s, cur_e = s, e
+    merged.append((cur_s, cur_e))
 
-    # 5. Проверка условия об одном платежном дне в неделю.
-    pay_day_clause_found = False
-    for line in text.splitlines():
-        if "платеж" in line.lower() and "недел" in line.lower():
-            pay_day_clause_found = True
-            if ("1 раз в неделю" in line.lower()) or ("один раз в неделю" in line.lower()) or ("один платежный день" in line.lower()):
-                # Clause correctly states one payment day per week (standard condition)
-                pass  # no violation
+    out = []
+    last = 0
+    for s, e in merged:
+        out.append(text[last:s])
+        out.append("<mark>")
+        out.append(text[s:e])
+        out.append("</mark>")
+        last = e
+    out.append(text[last:])
+    return "".join(out)
+
+
+# YAML loader
+try:
+    import yaml  # type: ignore
+except Exception:
+    yaml = None
+
+
+def _load_yaml(path: str) -> Dict[str, Any]:
+    if yaml is None:
+        with open(path, "r", encoding="utf-8") as f:
+            raw = f.read()
+        try:
+            return json.loads(raw)
+        except Exception as e:
+            raise RuntimeError("Установите PyYAML: pip install pyyaml") from e
+    else:
+        with open(path, "r", encoding="utf-8") as f:
+            return yaml.safe_load(f) or {}
+
+
+@dataclass
+class Rule:
+    rule_id: str
+    name: str
+    description: str
+    applies_to_templates: List[str]
+    severity: str
+    mode: str
+    params: Dict[str, Any] = field(default_factory=dict)
+    triggers: List[Dict[str, Any]] = field(default_factory=list)
+    enabled: bool = True
+
+
+@dataclass
+class Finding:
+    rule_id: str
+    rule_name: str
+    severity: str
+    paragraph_index: int
+    paragraph_text: str
+    paragraph_html: str
+    highlights: List[Tuple[int, int]]
+    details: Dict[str, Any]
+    score: Optional[float] = None  # reranker score if available
+
+
+class AuditEngine:
+    def __init__(self, rules_path: str = DEFAULT_CONFIG_PATH):
+        cfg = _load_yaml(rules_path)
+        raw_rules = cfg.get("rules", [])
+        self.rules: List[Rule] = [Rule(**r)
+                                  for r in raw_rules if r.get("enabled", True)]
+
+    def audit(self, text: str, template_hint: Optional[str] = None) -> Tuple[str, List[Dict[str, Any]]]:
+        if not text or len(text.strip()) < 50:
+            return STATUS_UNKNOWN, []
+
+        paragraphs = _split_paragraphs(text)
+        # optional reranking: pre-score paragraphs per rule to suppress noise
+        pre_scores: Dict[Tuple[int, str], float] = {}
+        if _RERANKER is not None:
+            pairs = []
+            keys = []
+            for idx, para in enumerate(paragraphs):
+                for rule in self.rules:
+                    # quick trigger first; if no triggers defined, consider anyway
+                    if rule.triggers and not self._any_trigger(rule, para):
+                        continue
+                    keys.append((idx, rule.rule_id))
+                    pairs.append([para[:512], rule.name])
+            if pairs:
+                scores = _RERANKER.predict(pairs)
+                for k, s in zip(keys, scores):
+                    pre_scores[k] = float(s)
+
+        findings: List[Finding] = []
+
+        for idx, para in enumerate(paragraphs):
+            para_l = para.lower()
+            for rule in self.rules:
+                if not self._rule_applies(rule, template_hint):
+                    continue
+                if rule.triggers and not self._any_trigger(rule, para):
+                    continue
+                # if reranker available: skip low-score pairs
+                if pre_scores:
+                    s = pre_scores.get((idx, rule.rule_id), 0.0)
+                    if s < float(os.environ.get("CDS_RERANKER_THRESHOLD", "0.2")):
+                        continue
+                violated, details, spans = self._evaluate(rule, para, para_l)
+                if violated:
+                    score = pre_scores.get(
+                        (idx, rule.rule_id)) if pre_scores else None
+                    findings.append(Finding(
+                        rule_id=rule.rule_id,
+                        rule_name=rule.name,
+                        severity=rule.severity,
+                        paragraph_index=idx,
+                        paragraph_text=para,
+                        paragraph_html=_highlight(para, spans),
+                        highlights=spans,
+                        details=details,
+                        score=score
+                    ))
+
+        if not findings:
+            return STATUS_STANDARD, []
+
+        severity_rank = {"critical": 3, "major": 2, "minor": 1}
+        top = max((severity_rank.get(f.severity, 1)
+                  for f in findings), default=1)
+        status = STATUS_NONSTANDARD if top >= 2 else STATUS_STANDARD
+        return status, [f.__dict__ for f in findings]
+
+    def _rule_applies(self, rule: Rule, template_hint: Optional[str]) -> bool:
+        if not rule.applies_to_templates:
+            return True
+        if "Все" in rule.applies_to_templates:
+            return True
+        if not template_hint:
+            return True
+        for t in rule.applies_to_templates:
+            if t.startswith("r:"):
+                if re.search(t[2:], template_hint, re.I):
+                    return True
             else:
-                # Clause is present but altered (e.g., two payment days per week)
-                violations.append({
-                    "description": "Условие об одном платежном дне в неделю изменено",
-                    "found_text": line.strip()
-                })
-            break
-    if not pay_day_clause_found:
-        violations.append({
-            "description": "В тексте отсутствует условие об одном платежном дне в неделю",
-            "found_text": ""
-        })
+                if t.lower() in template_hint.lower():
+                    return True
+        return False
 
-    # 6. Проверка на наличие "протокола разногласий" (признак нестандартного договора).
-    if "протокол разноглас" in text_lower:
-        idx = text_lower.index("протокол разноглас")
-        snippet_start = text.rfind('.', 0, idx)
-        snippet_nl = text.rfind('\n', 0, idx)
-        start_idx = max(snippet_start, snippet_nl)
-        if start_idx == -1:
-            start_idx = 0
+    def _any_trigger(self, rule: Rule, para: str) -> bool:
+        for trg in rule.triggers:
+            if trg.get("type") == "regex_any":
+                for pat in trg.get("patterns", []):
+                    if re.search(pat, para, flags=re.I | re.M):
+                        return True
+        return False
+
+    def _evaluate(self, rule: Rule, para: str, para_l: str) -> Tuple[bool, Dict[str, Any], List[Tuple[int, int]]]:
+        mode = rule.mode
+        if mode == "deny_on_match":
+            banned = rule.params.get("banned_regex", [])
+            spans = []
+            hit = False
+            for pat in banned:
+                s = _iter_matches(pat, para)
+                if s:
+                    spans.extend(s)
+                    hit = True
+            return (hit, {"matched": True} if hit else {}, spans)
+
+        if mode == "custom":
+            handler = getattr(self, f"_rule_{rule.rule_id.lower()}", None)
+            if callable(handler):
+                return handler(rule, para, para_l)
+            banned = rule.params.get("banned_regex", [])
+            spans = []
+            hit = False
+            for pat in banned:
+                s = _iter_matches(pat, para)
+                if s:
+                    spans.extend(s)
+                    hit = True
+            return (hit, {"matched": True} if hit else {}, spans)
+
+        return (False, {}, [])
+
+    # helpers
+    def _extract_days_number(self, para_l: str, regexes: List[str]) -> Optional[Tuple[int, str, Tuple[int, int]]]:
+        # NER-powered normalization (optional)
+        for r in regexes:
+            m = re.search(r, para_l, flags=re.I | re.M)
+            if m:
+                try:
+                    days = int(m.group(1))
+                    kind = m.group(
+                        2) if m.lastindex and m.lastindex >= 2 else ""
+                    return days, kind, (m.start(1), m.end(1))
+                except Exception:
+                    continue
+        # spaCy: parse "в двух неделях" etc. (простая эвристика)
+        if _SPACY_NLP is not None:
+            doc = _SPACY_NLP(para_l)
+            for ent in doc.ents:
+                if ent.label_.lower() in ("date", "time"):
+                    if "дн" in ent.text or "недел" in ent.text:
+                        # грубая конверсия
+                        m = re.search(r"(\d{1,3})", ent.text)
+                        if m:
+                            val = int(m.group(1))
+                            if "недел" in ent.text:
+                                val *= 7
+                            return val, "календарные", (ent.start_char, ent.end_char)
+        return None
+
+    # R2
+    def _rule_r2_term_duration(self, rule: Rule, para: str, para_l: str):
+        spans = []
+        for pat in rule.params.get("banned_regex", []):
+            s = _iter_matches(pat, para)
+            spans.extend(s)
+        date_pairs = []
+        for pat in rule.params.get("date_regex", []):
+            for m in re.finditer(pat, para, flags=re.I | re.M):
+                if m.lastindex and m.lastindex >= 2:
+                    d1 = _to_date(m.group(1))
+                    d2 = _to_date(m.group(2))
+                    if d1 and d2:
+                        date_pairs.append(
+                            (d1, d2, (m.start(1), m.end(1)), (m.start(2), m.end(2))))
+                elif m.lastindex and m.lastindex >= 1:
+                    d2 = _to_date(m.group(1))
+                    if d2:
+                        date_pairs.append(
+                            (None, d2, None, (m.start(1), m.end(1))))
+        details = {}
+        violated = False
+        max_years = int(rule.params.get("max_years", 3))
+        for (d1, d2, s1, s2) in date_pairs:
+            if s1:
+                spans.append(s1)
+            if s2:
+                spans.append(s2)
+            if d1 and d2:
+                days = _days_between(d1, d2)
+                details["duration_days"] = days
+                if days is not None and days > max_years * 365:
+                    violated = True
+        if spans and any(re.search(p, para, flags=re.I | re.M) for p in rule.params.get("banned_regex", [])):
+            violated = True
+        return violated, details, spans
+
+    # R3
+    def _rule_r3_payment_term(self, rule: Rule, para: str, para_l: str):
+        spans = []
+        ex = any(re.search(p, para, flags=re.I | re.M)
+                 for p in rule.params.get("exception_regex", []))
+        res = self._extract_days_number(
+            para_l, rule.params.get("days_regex", []))
+        details = {}
+        violated = False
+        if res:
+            days, kind, pos = res
+            spans.append(pos)
+            details["payment_term_days"] = days
+            details["kind"] = kind
+            min_days = int(rule.params.get("min_days", 60))
+            if days < min_days and not ex:
+                violated = True
+        return violated, details, spans
+
+    # R4
+    def _rule_r4_prepayment(self, rule: Rule, para: str, para_l: str):
+        spans = []
+        prepay = any(re.search(p, para, flags=re.I | re.M)
+                     for p in rule.params.get("prepay_regex", []))
+        if not prepay:
+            return False, {}, []
+        cond = any(re.search(p, para, flags=re.I | re.M)
+                   for p in rule.params.get("condition_regex", []))
+        for p in rule.params.get("prepay_regex", []):
+            spans.extend(_iter_matches(p, para))
+        violated = not cond
+        return violated, {"prepayment_detected": True, "conditions_present": cond}, spans
+
+    # R5
+    def _rule_r5_acceptance_term(self, rule: Rule, para: str, para_l: str):
+        spans = []
+        if not any(re.search(p, para, flags=re.I | re.M) for p in rule.params.get("subject_markers", [])):
+            return False, {}, []
+        res = self._extract_days_number(
+            para_l, rule.params.get("days_regex", []))
+        violated = False
+        details = {}
+        if res:
+            days, kind, pos = res
+            spans.append(pos)
+            details["acceptance_days"] = days
+            if days < int(rule.params.get("min_workdays", 5)):
+                violated = True
         else:
-            start_idx += 1
-        snippet_end = text.find('.', idx)
-        snippet_nl2 = text.find('\n', idx)
-        end_idx = snippet_end
-        if end_idx == -1 or (snippet_nl2 != -1 and snippet_nl2 < end_idx):
-            end_idx = snippet_nl2
-        if end_idx == -1:
-            end_idx = len(text)
-        violations.append({
-            "description": "Обнаружено упоминание протокола разногласий (нестандартные изменения условий договора)",
-            "found_text": text[start_idx:end_idx].strip()
-        })
+            violated = True
+            details["missing_term"] = True
+        return violated, details, spans
 
-    # 7. Проверка допустимых изменений в самом договоре
-    # Допустимы только: сокращение срока оплаты, сокращение сроков приёмки (но не менее 5 РД),
-    # введение ответственности Заказчика, изменение гарантийного срока
-    unauthorized_changes = []
+    # R6
+    def _rule_r6_payment_day(self, rule: Rule, para: str, para_l: str):
+        spans = []
 
-    # Проверка на недопустимые изменения базовых условий
-    change_indicators = [
-        "изменение условий", "дополнительные условия", "особые условия",
-        "отличающиеся от стандартных", "в отступление от"
-    ]
+        # Проверяем исключающий контекст (санкции/ответственность)
+        exclude = rule.params.get("exclude_context", [])
+        if exclude:
+            for exc_pattern in exclude:
+                if re.search(exc_pattern, para, flags=re.I | re.M):
+                    # Найден исключающий контекст - не срабатываем
+                    return False, {}, []
 
-    for indicator in change_indicators:
-        if indicator in text_lower:
-            idx = text_lower.find(indicator)
-            sent_start = max(0, text.rfind('.', 0, idx) + 1)
-            sent_end = text.find('.', idx)
-            if sent_end == -1:
-                sent_end = min(idx + 150, len(text))
+        # Проверяем наличие якорей платежей (опционально)
+        anchors = rule.params.get("anchor_any", [])
+        if anchors:
+            has_anchor = any(re.search(p, para, flags=re.I | re.M)
+                             for p in anchors)
+            if not has_anchor:
+                # Нет якорей платежа - не срабатываем
+                return False, {}, []
 
-            change_text = text_lower[sent_start:sent_end]
+        weekly = any(re.search(p, para, flags=re.I | re.M)
+                     for p in rule.params.get("weekly_regex", []))
+        non_week = any(re.search(p, para, flags=re.I | re.M)
+                       for p in rule.params.get("non_weekly_ban_regex", []))
+        if non_week and not weekly:
+            for p in rule.params.get("non_weekly_ban_regex", []):
+                spans.extend(_iter_matches(p, para))
+            return True, {"non_weekly_detected": True}, spans
+        return False, {}, []
 
-            # Проверяем, являются ли изменения допустимыми
-            allowed_changes = [
-                "срок оплат", "срок приемки", "ответственность заказчика",
-                "гарантийн", "гарантий"
-            ]
+    # R7
+    def _rule_r7_allowed_changes_in_contract(self, rule: Rule, para: str, para_l: str):
+        spans = []
+        violated = False
+        for p in rule.params.get("banned_keywords", []):
+            s = _iter_matches(p, para)
+            if s:
+                spans.extend(s)
+                violated = True
+        return violated, {}, spans
 
-            is_allowed = any(
-                allowed in change_text for allowed in allowed_changes)
+    # R8
+    def _rule_r8_allowed_changes_in_addenda(self, rule: Rule, para: str, para_l: str):
+        spans = []
+        is_addendum = re.search(
+            r"доп(?:олнительн\w*)?\s*соглашени", para, flags=re.I | re.M) is not None
+        if not is_addendum:
+            return False, {}, []
+        for p in rule.params.get("ban_if_contains", []):
+            s = _iter_matches(p, para)
+            if s:
+                spans.extend(s)
+                return True, {"ban_phrase": True}, spans
+        allowed = any(re.search(p, para, flags=re.I | re.M)
+                      for p in rule.params.get("allowed_keywords", []))
+        if not allowed:
+            return True, {"allowed_matched": False}, []
+        return False, {}, []
 
-            if not is_allowed:
-                violations.append({
-                    "description": "Обнаружены недопустимые изменения базовых условий договора",
-                    "found_text": text[sent_start:sent_end].strip()
-                })
-                break
+    # R9
+    def _rule_r9_spec_app_tz(self, rule: Rule, para: str, para_l: str):
+        spans = []
+        is_spec = re.search(
+            r"спецификац|приложени|технич[её]ск[оеая]\s+задани", para, flags=re.I | re.M) is not None
+        if not is_spec:
+            return False, {}, []
+        must_any = rule.params.get("must_have_any", [])
+        has_any = any(re.search(p, para, flags=re.I | re.M) for p in must_any)
+        if not has_any:
+            return True, {"missing_core_fields": True}, []
+        for p in rule.params.get("ban_new_terms_regex", []):
+            s = _iter_matches(p, para)
+            if s:
+                spans.extend(s)
+                return True, {"new_terms_detected": True}, spans
+        return False, {}, []
 
-    # 8. Проверка типа документа (допсоглашение)
-    is_additional_agreement = any(word in text_lower for word in [
-        "дополнительное соглашение", "допсоглашение", "доп. соглашение"
-    ])
+    # R10
+    def _rule_r10_frame_contract(self, rule: Rule, para: str, para_l: str):
+        spans = []
+        is_frame = any(re.search(p, para, flags=re.I | re.M)
+                       for p in rule.params.get("frame_markers", []))
+        if not is_frame:
+            return False, {}, []
+        ok = any(re.search(p, para, flags=re.I | re.M)
+                 for p in rule.params.get("must_have_any", []))
+        if not ok:
+            return True, {"missing_limits": True}, []
+        return False, {}, []
 
-    if is_additional_agreement:
-        # Для допсоглашения разрешены: лимит, срок действия, сокращение срока оплаты/предоплата (с 6.6),
-        # увеличение срока приёмки, изменение сроков поставки, реквизиты, симметричная ответственность
-        allowed_additional_changes = [
-            "лимит", "срок действия", "срок оплат", "предоплат", "срок приемки",
-            "срок поставки", "реквизиты", "ответственность заказчика"
-        ]
-        # Эта проверка требует более детального анализа содержания допсоглашения
-        # Пока добавляем информационное сообщение
-        pass
 
-    # 9. Проверка стандартной спецификации/приложения/ТЗ
-    has_specification = any(word in text_lower for word in [
-        "спецификация", "приложение", "техническое задание", "тз"
-    ])
+_engine_singleton: Optional["AuditEngine"] = None
 
-    if has_specification:
-        # Спецификация должна содержать: предмет, цену, сроки, порядок исполнения,
-        # условия доставки, допускаемые условия по оплате, гарантийный срок
-        spec_required_elements = [
-            "предмет", "цена", "срок", "стоимость"
-        ]
 
-        missing_elements = [
-            elem for elem in spec_required_elements if elem not in text_lower]
+def _get_engine() -> "AuditEngine":
+    global _engine_singleton
+    if _engine_singleton is None:
+        _engine_singleton = AuditEngine()
+    return _engine_singleton
 
-        if len(missing_elements) > 2:  # Если отсутствует больше половины обязательных элементов
-            violations.append({
-                "description": f"В спецификации/приложении отсутствуют обязательные элементы: {', '.join(missing_elements)}",
-                "found_text": "Спецификация неполная"
-            })
 
-    # 10. Проверка рамочного договора
-    is_framework_contract = any(phrase in text_lower for phrase in [
-        "рамочный договор", "генеральное соглашение", "договор на неопределенный объем"
-    ])
-
-    if is_framework_contract:
-        # Рамочный договор должен содержать описание природы правоотношений
-        # и возможность изменения лимитов через стандартные допы/спеки
-        if "лимит" not in text_lower and "объем" not in text_lower:
-            violations.append({
-                "description": "В рамочном договоре не указаны лимиты или максимальные объемы",
-                "found_text": "Отсутствуют лимиты рамочного договора"
-            })
-
-    # Determine overall status based on collected violations
-    status = STATUS_STANDARD
-    if violations:
-        status = STATUS_NONSTANDARD
-
-    return status, violations
+def check_contract_standardness(contract_text: str, template_hint: Optional[str] = None, config_path: Optional[str] = None):
+    """
+    Возвращает (status, findings). findings содержит поля:
+      rule_id, rule_name, severity, paragraph_index, paragraph_text, paragraph_html, highlights, details, score
+    """
+    if config_path and config_path != DEFAULT_CONFIG_PATH:
+        engine = AuditEngine(config_path)
+        return engine.audit(contract_text, template_hint)
+    return _get_engine().audit(contract_text, template_hint)
